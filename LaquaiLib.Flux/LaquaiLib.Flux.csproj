@@ -2,7 +2,8 @@
 
   <PropertyGroup>
     <OutputType>Library</OutputType>
-    <TargetFrameworks>netstandard2.0</TargetFrameworks>
+    <TargetFrameworks>net8.0;net9.0</TargetFrameworks>
+    <RollForward>LatestMajor</RollForward>
     <Nullable>disable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
@@ -18,6 +19,7 @@
     <GenerateDocumentationFile>True</GenerateDocumentationFile>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
     <IncludeSymbols>True</IncludeSymbols>
+    <IsAotCompatible>true</IsAotCompatible>
     <Version>0.1.0</Version>
 
     <PackageId>$(AssemblyName)</PackageId>
@@ -37,14 +39,20 @@
       <InternalsVisibleTo Include="$(AssemblyName).Benchmarks" />
       <InternalsVisibleTo Include="$(AssemblyName).Tests" />
 
+      <Using Include="System.Buffers" />
       <Using Include="System.Diagnostics" />
+      <Using Include="System.Diagnostics.Metrics" />
+      <Using Include="System.Threading.Channels" />
 
       <Using Include="System.Runtime.CompilerServices" />
       <Using Include="System.Runtime.InteropServices" />
 
       <Using Include="System.Text" />
-      <Using Include="System.Text.Json" />
-      <Using Include="System.Text.Json.Serialization" />
+
+      <Using Condition="'$(TargetFramework)' == 'net9.0'"
+             Include="System.Threading.Lock" Alias="LockType" />
+      <Using Condition="'$(TargetFramework)' == 'net8.0'"
+             Include="System.Object" Alias="LockType" />
   </ItemGroup>
 
 </Project>
