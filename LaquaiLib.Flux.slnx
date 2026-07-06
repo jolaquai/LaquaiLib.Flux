@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/Solution Items/">
+    <File Path=".gitignore" />
+    <File Path="LICENSE" />
+    <File Path="README.md" />
+  </Folder>
+  <Project Path="LaquaiLib.Flux/LaquaiLib.Flux.csproj" />
+  <Project Path="LaquaiLib.Flux.Tests/LaquaiLib.Flux.Tests.csproj" />
+  <Project Path="LaquaiLib.Flux.Benchmarks/LaquaiLib.Flux.Benchmarks.csproj" />
+</Solution>

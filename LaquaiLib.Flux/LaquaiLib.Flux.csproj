@@ -1,0 +1,50 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFrameworks>netstandard2.0</TargetFrameworks>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <RootNamespace>LaquaiLib.Flux</RootNamespace>
+
+    <LangVersion>latest</LangVersion>
+    <RollForward>LatestMajor</RollForward>
+    <DebugType>portable</DebugType>
+    <DebugSymbols>True</DebugSymbols>
+    <GeneratePackageOnBuild Condition="'$(Configuration)' == 'Release'">True</GeneratePackageOnBuild>
+    <GenerateDocumentationFile>True</GenerateDocumentationFile>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <IncludeSymbols>True</IncludeSymbols>
+    <Version>0.1.0</Version>
+
+    <PackageId>$(AssemblyName)</PackageId>
+    <PackageVersion>$(Version)</PackageVersion>
+    <PackageDescription></PackageDescription>
+    <PackageRequireLicenseAcceptance>False</PackageRequireLicenseAcceptance>
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+
+    <RepositoryType>git</RepositoryType>
+    <RepositoryUrl>https://github.com/jolaquai/$(AssemblyName)</RepositoryUrl>
+  </PropertyGroup>
+
+  <ItemGroup>
+      <None Include="..\LICENSE;..\README.md" Pack="True" PackagePath="/" />
+
+      <InternalsVisibleTo Include="$(AssemblyName).Benchmarks" />
+      <InternalsVisibleTo Include="$(AssemblyName).Tests" />
+
+      <Using Include="System.Diagnostics" />
+
+      <Using Include="System.Runtime.CompilerServices" />
+      <Using Include="System.Runtime.InteropServices" />
+
+      <Using Include="System.Text" />
+      <Using Include="System.Text.Json" />
+      <Using Include="System.Text.Json.Serialization" />
+  </ItemGroup>
+
+</Project>
