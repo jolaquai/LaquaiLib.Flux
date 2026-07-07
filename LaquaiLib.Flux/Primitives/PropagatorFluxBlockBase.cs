@@ -33,6 +33,10 @@ public abstract class PropagatorFluxBlockBase<TIn, TOut> : TargetFluxBlockBase<T
 #endif
         _linksLock = new();
     private readonly List<FluxLink<TOut>> _links = new(capacity: 1);
+    // Immutable snapshot of _links, republished under _linksLock on every LinkTo/Unlink. The dispatch loop reads
+    // this once per item instead of materializing a fresh array per item under the lock - snapshotting per item
+    // was, by itself, the single largest allocation source in multi-stage pipelines.
+    private FluxLink<TOut>[] _linksSnapshot = [];
     private int _dispatchStarted;
 
     private protected PropagatorFluxBlockBase(FluxBlockOptions options, bool inputSingleReader, bool outputSingleWriter)
@@ -61,6 +65,7 @@ public abstract class PropagatorFluxBlockBase<TIn, TOut> : TargetFluxBlockBase<T
                 throw new InvalidOperationException($"'{Name}' already has an active link. v1 permits at most one linked target per source; dispose the IDisposable returned by the prior LinkTo call first.");
             }
             _links.Add(link);
+            Volatile.Write(ref _linksSnapshot, [.. _links]);
         }
 
         if (Interlocked.Exchange(ref _dispatchStarted, 1) == 0)
@@ -77,40 +82,40 @@ public abstract class PropagatorFluxBlockBase<TIn, TOut> : TargetFluxBlockBase<T
         lock (_linksLock)
         {
             _links.Remove(link);
+            Volatile.Write(ref _linksSnapshot, _links.Count == 0 ? [] : [.. _links]);
         }
     }
 
     /// <inheritdoc/>
     public IAsyncEnumerable<TOut> ReceiveAllAsync(CancellationToken cancellationToken = default) => _output.Reader.ReadAllAsync(cancellationToken);
 
-    private FluxLink<TOut>[] SnapshotLinks()
-    {
-        lock (_linksLock)
-        {
-            return _links.Count == 0 ? [] : [.. _links];
-        }
-    }
-
     private async Task DispatchLoopAsync()
     {
+        var reader = _output.Reader;
         Exception fault = null;
         try
         {
-            await foreach (var item in _output.Reader.ReadAllAsync(_completionCts.Token).ConfigureAwait(false))
+            while (await reader.WaitToReadAsync(_loopToken).ConfigureAwait(false))
             {
-                var links = SnapshotLinks();
-                if (links.Length == 0)
+                while (reader.TryRead(out var item))
                 {
-                    FluxMetrics.ItemsDropped.Add(1, _tags);
-                    continue;
-                }
-
-                foreach (var link in links)
-                {
-                    var accepted = await link.Target.SendAsync(item, _completionCts.Token).ConfigureAwait(false);
-                    if (!accepted)
+                    var links = Volatile.Read(ref _linksSnapshot);
+                    if (links.Length == 0)
                     {
-                        FluxMetrics.ItemsDropped.Add(1, _tags);
+                        if (FluxMetrics.ItemsDropped.Enabled)
+                        {
+                            FluxMetrics.ItemsDropped.Add(1, _tags);
+                        }
+                        continue;
+                    }
+
+                    foreach (var link in links)
+                    {
+                        var accepted = await link.Target.SendAsync(item, _loopToken).ConfigureAwait(false);
+                        if (!accepted && FluxMetrics.ItemsDropped.Enabled)
+                        {
+                            FluxMetrics.ItemsDropped.Add(1, _tags);
+                        }
                     }
                 }
             }
@@ -120,7 +125,7 @@ public abstract class PropagatorFluxBlockBase<TIn, TOut> : TargetFluxBlockBase<T
             fault = ex;
         }
 
-        foreach (var link in SnapshotLinks())
+        foreach (var link in Volatile.Read(ref _linksSnapshot))
         {
             if (fault is not null)
             {

@@ -25,6 +25,16 @@ public abstract class TargetFluxBlockBase<TIn> : IFluxTarget<TIn>
     private protected readonly CancellationTokenSource _completionCts;
     private protected readonly TagList _tags;
 
+    /// <summary>
+    /// The token internal read/dispatch loops pass to channel waits. This is <see cref="CancellationToken.None"/>
+    /// whenever the options token can never fire: a cancelable token forces every suspended channel operation to
+    /// allocate a fresh async operation plus a cancellation registration instead of reusing the channel's pooled
+    /// one, which is pure per-suspension overhead when nothing can ever cancel. <see cref="_completionCts"/> is
+    /// never canceled independently of the options token today, so nothing is lost by not observing it here; if
+    /// that ever changes, this must go back to always being <see cref="_completionCts"/>'s token.
+    /// </summary>
+    private protected readonly CancellationToken _loopToken;
+
     private readonly TaskCompletionSource _completionTcs;
     private Exception _fault;
 
@@ -50,12 +60,14 @@ public abstract class TargetFluxBlockBase<TIn> : IFluxTarget<TIn>
         _completionCts = _options.CancellationToken.CanBeCanceled
             ? CancellationTokenSource.CreateLinkedTokenSource(_options.CancellationToken)
             : new CancellationTokenSource();
+        _loopToken = _options.CancellationToken.CanBeCanceled ? _completionCts.Token : default;
         _completionTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         FluxBlockDiagnostics.RegisterInput(Name, _input.Reader);
     }
 
     /// <inheritdoc/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ValueTask<bool> SendAsync(TIn item, CancellationToken cancellationToken = default)
     {
         if (TryOffer(item))
@@ -66,11 +78,16 @@ public abstract class TargetFluxBlockBase<TIn> : IFluxTarget<TIn>
     }
 
     /// <inheritdoc/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryOffer(TIn item)
     {
         if (_input.Writer.TryWrite(item))
         {
-            FluxMetrics.ItemsAccepted.Add(1, _tags);
+            // Enabled-gated so the no-listener case pays a single branch instead of the full Add call.
+            if (FluxMetrics.ItemsAccepted.Enabled)
+            {
+                FluxMetrics.ItemsAccepted.Add(1, _tags);
+            }
             return true;
         }
         return false;
@@ -80,14 +97,16 @@ public abstract class TargetFluxBlockBase<TIn> : IFluxTarget<TIn>
     {
         while (true)
         {
-            FluxMetrics.BackpressureEvents.Add(1, _tags);
+            if (FluxMetrics.BackpressureEvents.Enabled)
+            {
+                FluxMetrics.BackpressureEvents.Add(1, _tags);
+            }
             if (!await _input.Writer.WaitToWriteAsync(cancellationToken).ConfigureAwait(false))
             {
                 return false;
             }
-            if (_input.Writer.TryWrite(item))
+            if (TryOffer(item))
             {
-                FluxMetrics.ItemsAccepted.Add(1, _tags);
                 return true;
             }
         }

@@ -11,7 +11,7 @@ public sealed class FluxLinkOptions
     public static readonly FluxLinkOptions Default = new();
 
     /// <summary>
-    /// Gets or sets whether the upstream source completing (or faulting) automatically propagates to the linked
+    /// Gets or sets whether the upstream source completing automatically propagates to the linked
     /// target by calling its <see cref="IFluxTarget{TIn}.Complete"/> once all in-flight items have drained.
     /// Defaults to <see langword="true"/>.
     /// <para/>

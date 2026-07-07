@@ -41,11 +41,6 @@ internal static class FluxBlockDiagnostics
     /// <summary>Observable-gauge callback backing <see cref="FluxMetrics.OutputQueueDepth"/>.</summary>
     public static IEnumerable<Measurement<int>> ObserveOutputQueueDepths() => Observe(_outputLock, _outputEntries);
 
-    // Never holds the registry lock across a yield return: a suspended iterator only resumes whenever the metrics
-    // consumer (dotnet-counters/OTel export cadence) decides to pull the next value, which could be arbitrarily
-    // delayed, so holding the lock across that suspension point would be a real deadlock risk against concurrent
-    // Register calls, not just a style nit. Dead entries (block was GC'd) are purged under the lock up front,
-    // before the snapshot is taken, so the list self-prunes without any finalizer or IDisposable dependency.
     private static IEnumerable<Measurement<int>> Observe(LockType registryLock, List<Entry> entries)
     {
         Entry[] snapshot;
