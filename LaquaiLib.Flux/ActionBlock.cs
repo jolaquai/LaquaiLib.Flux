@@ -1,3 +1,4 @@
+using LaquaiLib.Flux.Diagnostics;
 using LaquaiLib.Flux.Primitives;
 
 namespace LaquaiLib.Flux;
@@ -8,6 +9,10 @@ namespace LaquaiLib.Flux;
 /// <typeparam name="TIn">The type of item accepted by this block.</typeparam>
 public sealed class ActionBlock<TIn> : TargetFluxBlockBase<TIn>
 {
+    private readonly Func<TIn, ValueTask> _action;
+    private readonly int _maxDegreeOfParallelism;
+    private readonly Task[] _workers;
+
     /// <summary>
     /// Initializes a new <see cref="ActionBlock{TIn}"/> using a synchronous action delegate.
     /// </summary>
@@ -30,7 +35,14 @@ public sealed class ActionBlock<TIn> : TargetFluxBlockBase<TIn>
         : base(options, ComputeSingleReader(options))
     {
         ArgumentNullException.ThrowIfNull(action);
-        throw new NotImplementedException("ActionBlock<TIn> is not yet implemented.");
+        _action = action;
+        _maxDegreeOfParallelism = GetMaxDegreeOfParallelism(_options);
+        _workers = new Task[_maxDegreeOfParallelism];
+        for (var i = 0; i < _workers.Length; i++)
+        {
+            _workers[i] = Task.Run(WorkerLoopAsync);
+        }
+        _ = FinalizeAsync();
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -44,5 +56,54 @@ public sealed class ActionBlock<TIn> : TargetFluxBlockBase<TIn>
         };
     }
 
-    private static bool ComputeSingleReader(FluxBlockOptions options) => Math.Max(1, (options ?? FluxBlockOptions.Default).MaxDegreeOfParallelism) == 1;
+    private static int GetMaxDegreeOfParallelism(FluxBlockOptions options) => Math.Clamp((options ?? FluxBlockOptions.Default).MaxDegreeOfParallelism, 1, 1 << 20);
+
+    private static bool ComputeSingleReader(FluxBlockOptions options) => GetMaxDegreeOfParallelism(options) == 1;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private ValueTask ActionMeasuredAsync(TIn item)
+    {
+        if (FluxMetrics.StageLatency.Enabled)
+        {
+            return ActionTimedAsync(item);
+        }
+        return _action(item);
+    }
+
+    private async ValueTask ActionTimedAsync(TIn item)
+    {
+        var start = Stopwatch.GetTimestamp();
+        await _action(item).ConfigureAwait(false);
+        FluxMetrics.StageLatency.Record(Stopwatch.GetElapsedTime(start).TotalMilliseconds, _tags);
+    }
+
+    private async Task WorkerLoopAsync()
+    {
+        var reader = _input.Reader;
+        try
+        {
+            while (await reader.WaitToReadAsync(_loopToken).ConfigureAwait(false))
+            {
+                while (reader.TryRead(out var item))
+                {
+                    await ActionMeasuredAsync(item).ConfigureAwait(false);
+                    if (FluxMetrics.ItemsProcessed.Enabled)
+                    {
+                        FluxMetrics.ItemsProcessed.Add(1, _tags);
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            TrySetFault(ex);
+            _input.Writer.TryComplete(ex);
+        }
+    }
+
+    private async Task FinalizeAsync()
+    {
+        await Task.WhenAll(_workers).ConfigureAwait(false);
+        ResolveCompletion(ObservedFault);
+    }
 }
