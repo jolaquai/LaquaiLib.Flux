@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <OutputType>Library</OutputType>
-    <TargetFrameworks>net8.0;net9.0</TargetFrameworks>
+    <TargetFrameworks>net8.0;net9.0;net10.0;net11.0</TargetFrameworks>
     <RollForward>LatestMajor</RollForward>
     <Nullable>disable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -49,9 +49,9 @@
 
       <Using Include="System.Text" />
 
-      <Using Condition="'$(TargetFramework)' == 'net9.0'"
+      <Using Condition="$(TargetFramework.StartsWith('net9')) or $(TargetFramework.StartsWith('net1'))"
              Include="System.Threading.Lock" Alias="LockType" />
-      <Using Condition="'$(TargetFramework)' == 'net8.0'"
+      <Using Condition="!($(TargetFramework.StartsWith('net9')) or $(TargetFramework.StartsWith('net1')))"
              Include="System.Object" Alias="LockType" />
   </ItemGroup>
 

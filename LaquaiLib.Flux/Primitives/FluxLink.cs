@@ -12,19 +12,21 @@ internal interface IFluxLinkOwner<TOut>
 }
 
 /// <summary>
-/// The <see cref="IDisposable"/> handle returned by <see cref="IFluxSource{TOut}.LinkTo"/>. Modeled as an entry in
-/// a list (owned by the source) rather than a single field, even though v1 enforces at most one live entry per
-/// source, so v2's real load-balanced fan-out only changes the internal dispatch loop that iterates the list,
-/// never this type or the public <see cref="IFluxSource{TOut}.LinkTo"/>/<see cref="FluxLinkOptions"/> contract.
+/// The <see cref="IDisposable"/> handle returned by <see cref="IFluxSource{TOut}.LinkTo"/>: an entry in a list
+/// owned by the source. Multiple links may be active simultaneously; <see cref="FluxBlockOptions.FanOutMode"/>
+/// governs how the dispatch loop routes items across them.
 /// </summary>
 /// <typeparam name="TOut">The linked element type.</typeparam>
-internal sealed class FluxLink<TOut>(IFluxLinkOwner<TOut> owner, IFluxTarget<TOut> target, FluxLinkOptions options) : IDisposable
+internal sealed class FluxLink<TOut>(IFluxLinkOwner<TOut> owner, IFluxTarget<TOut> target, FluxLinkOptions options, Func<TOut, bool> filter) : IDisposable
 {
     /// <summary>The target this link pushes items to.</summary>
     public IFluxTarget<TOut> Target { get; } = target;
 
     /// <summary>The options this link was created with.</summary>
     public FluxLinkOptions Options { get; } = options;
+
+    /// <summary>The predicate an item must satisfy to be routed through this link, or <see langword="null"/> to match every item.</summary>
+    public Func<TOut, bool> Filter { get; } = filter;
 
     private int _disposed;
 

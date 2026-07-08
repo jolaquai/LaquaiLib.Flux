@@ -30,7 +30,7 @@ public sealed class ActionBlock<TIn> : TargetFluxBlockBase<TIn>
         : base(options, ComputeSingleReader(options))
     {
         ArgumentNullException.ThrowIfNull(action);
-        throw new NotImplementedException("ActionBlock<TIn> is a v1 surface stub; full implementation lands in a follow-up pass.");
+        throw new NotImplementedException("ActionBlock<TIn> is not yet implemented.");
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
