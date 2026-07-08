@@ -7,6 +7,7 @@ public sealed class TransformBlockTests
     private sealed class RecordingTarget<T> : IFluxTarget<T>
     {
         private readonly TaskCompletionSource _completionTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private volatile bool _declining;
 
         public List<T> Received { get; } = [];
         public bool Completed { get; private set; }
@@ -18,6 +19,10 @@ public sealed class TransformBlockTests
 
         public bool TryOffer(T item)
         {
+            if (_declining)
+            {
+                return false;
+            }
             lock (Received)
             {
                 Received.Add(item);
@@ -28,12 +33,14 @@ public sealed class TransformBlockTests
         public void Complete()
         {
             Completed = true;
+            _declining = true;
             _completionTcs.TrySetResult();
         }
 
         public void Fault(Exception exception)
         {
             ArgumentNullException.ThrowIfNull(exception);
+            _declining = true;
             _completionTcs.TrySetException(exception);
         }
     }
@@ -254,11 +261,11 @@ public sealed class TransformBlockTests
     }
 
     [Fact]
-    public void LinkTo_SecondLinkWhileActive_Throws()
+    public void LinkTo_SecondLinkWhileActive_DoesNotThrow()
     {
         var block = new TransformBlock<int, int>(item => item);
-        using var link = block.LinkTo(new RecordingTarget<int>());
-        Assert.Throws<InvalidOperationException>(() => block.LinkTo(new RecordingTarget<int>()));
+        using var link1 = block.LinkTo(new RecordingTarget<int>());
+        using var link2 = block.LinkTo(new RecordingTarget<int>());
     }
 
     [Fact]
@@ -286,6 +293,171 @@ public sealed class TransformBlockTests
         await target.Completion;
 
         Assert.Equal([2, 4], target.Received);
+    }
+
+    // ───────────────────────────────────────────────
+    //  Fan-out (multi-link dispatch)
+    // ───────────────────────────────────────────────
+
+    [Fact]
+    public void LinkTo_SameTargetTwiceWithDifferentFilters_DoesNotThrow()
+    {
+        var block = new TransformBlock<int, int>(item => item);
+        var target = new RecordingTarget<int>();
+        using var link1 = block.LinkTo(target, filter: i => i % 2 == 0);
+        using var link2 = block.LinkTo(target, filter: i => i % 2 != 0);
+    }
+
+    [Fact]
+    public async Task LinkTo_Broadcast_DuplicatesToEveryLinkedTarget()
+    {
+        var block = new TransformBlock<int, int>(item => item);
+        var targetA = new RecordingTarget<int>();
+        var targetB = new RecordingTarget<int>();
+        using var linkA = block.LinkTo(targetA);
+        using var linkB = block.LinkTo(targetB);
+
+        await block.SendAsync(1, TestContext.Current.CancellationToken);
+        await block.SendAsync(2, TestContext.Current.CancellationToken);
+        block.Complete();
+
+        await block.Completion;
+        await targetA.Completion;
+        await targetB.Completion;
+
+        Assert.Equal([1, 2], targetA.Received);
+        Assert.Equal([1, 2], targetB.Received);
+    }
+
+    [Fact]
+    public async Task LinkTo_Broadcast_PerLinkFilter_RoutesOnlyMatchingItems()
+    {
+        var block = new TransformBlock<int, int>(item => item);
+        var evens = new RecordingTarget<int>();
+        var odds = new RecordingTarget<int>();
+        using var linkEvens = block.LinkTo(evens, filter: i => i % 2 == 0);
+        using var linkOdds = block.LinkTo(odds, filter: i => i % 2 != 0);
+
+        foreach (var i in Enumerable.Range(1, 4))
+        {
+            await block.SendAsync(i, TestContext.Current.CancellationToken);
+        }
+        block.Complete();
+
+        await block.Completion;
+        await evens.Completion;
+        await odds.Completion;
+
+        Assert.Equal([2, 4], evens.Received);
+        Assert.Equal([1, 3], odds.Received);
+    }
+
+    [Fact]
+    public async Task LinkTo_FirstAvailable_OnlyFirstLinkedTargetReceivesEachItem()
+    {
+        var block = new TransformBlock<int, int>(item => item, new FluxBlockOptions { FanOutMode = FluxFanOutMode.FirstAvailable });
+        var first = new RecordingTarget<int>();
+        var second = new RecordingTarget<int>();
+        using var linkFirst = block.LinkTo(first);
+        using var linkSecond = block.LinkTo(second);
+
+        await block.SendAsync(1, TestContext.Current.CancellationToken);
+        await block.SendAsync(2, TestContext.Current.CancellationToken);
+        block.Complete();
+
+        await block.Completion;
+        await first.Completion;
+        await second.Completion;
+
+        Assert.Equal([1, 2], first.Received);
+        Assert.Empty(second.Received);
+    }
+
+    [Fact]
+    public async Task LinkTo_FirstAvailable_PermanentlyDoneHigherPriorityLink_FailsOverToNext()
+    {
+        var block = new TransformBlock<int, int>(item => item, new FluxBlockOptions { FanOutMode = FluxFanOutMode.FirstAvailable });
+        var first = new RecordingTarget<int>();
+        var second = new RecordingTarget<int>();
+        using var linkFirst = block.LinkTo(first);
+        using var linkSecond = block.LinkTo(second);
+
+        first.Complete(); // retire the higher-priority target before any items flow
+
+        await block.SendAsync(1, TestContext.Current.CancellationToken);
+        await block.SendAsync(2, TestContext.Current.CancellationToken);
+        block.Complete();
+
+        await block.Completion;
+        await second.Completion;
+
+        Assert.Empty(first.Received);
+        Assert.Equal([1, 2], second.Received);
+    }
+
+    [Fact]
+    public async Task LinkTo_RoundRobin_AlternatesAcrossTargets_WhenBothAlwaysFree()
+    {
+        var block = new TransformBlock<int, int>(item => item, new FluxBlockOptions { FanOutMode = FluxFanOutMode.RoundRobin });
+        var targetA = new RecordingTarget<int>();
+        var targetB = new RecordingTarget<int>();
+        using var linkA = block.LinkTo(targetA);
+        using var linkB = block.LinkTo(targetB);
+
+        const int itemCount = 20;
+        for (var i = 0; i < itemCount; i++)
+        {
+            await block.SendAsync(i, TestContext.Current.CancellationToken);
+        }
+        block.Complete();
+
+        await block.Completion;
+        await targetA.Completion;
+        await targetB.Completion;
+
+        // No drops, no duplicates.
+        Assert.Equal(itemCount, targetA.Received.Count + targetB.Received.Count);
+        Assert.Empty(targetA.Received.Intersect(targetB.Received));
+        // Both targets always have room and MaxDegreeOfParallelism defaults to 1 (strict output order), so the
+        // rotating cursor deterministically alternates evenly between exactly two always-free targets.
+        Assert.Equal(itemCount / 2, targetA.Received.Count);
+        Assert.Equal(itemCount / 2, targetB.Received.Count);
+    }
+
+    [Fact]
+    public async Task Complete_MultiLink_PropagatesToEveryLinkedTarget()
+    {
+        var block = new TransformBlock<int, int>(item => item);
+        var targetA = new RecordingTarget<int>();
+        var targetB = new RecordingTarget<int>();
+        using var linkA = block.LinkTo(targetA);
+        using var linkB = block.LinkTo(targetB);
+
+        block.Complete();
+
+        await targetA.Completion;
+        await targetB.Completion;
+
+        Assert.True(targetA.Completed);
+        Assert.True(targetB.Completed);
+    }
+
+    [Fact]
+    public async Task Fault_MultiLink_PropagatesToEveryLinkedTarget()
+    {
+        var block = new TransformBlock<int, int>(item => item);
+        var targetA = new RecordingTarget<int>();
+        var targetB = new RecordingTarget<int>();
+        using var linkA = block.LinkTo(targetA);
+        using var linkB = block.LinkTo(targetB);
+
+        var exception = new InvalidOperationException("boom");
+        block.Fault(exception);
+
+        var thrownA = await Assert.ThrowsAsync<InvalidOperationException>(async () => await targetA.Completion);
+        var thrownB = await Assert.ThrowsAsync<InvalidOperationException>(async () => await targetB.Completion);
+        Assert.Same(exception, thrownA);
+        Assert.Same(exception, thrownB);
     }
 
     // ───────────────────────────────────────────────
