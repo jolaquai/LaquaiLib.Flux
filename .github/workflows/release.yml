@@ -6,12 +6,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # required to create releases / upload assets
-  id-token: write # required for NuGet Trusted Publishing (OIDC)
+  contents: read
 
 concurrency:
   group: build-${{ github.ref }}
-  cancel-in-progress: true
+  # Never cancel an in-flight release on main - it could be mid-tag/publish.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   test:
@@ -40,6 +40,9 @@ jobs:
   release:
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # required to create releases / upload assets
+      id-token: write # required for NuGet Trusted Publishing (OIDC)
 
     steps:
       - name: Checkout
