@@ -68,10 +68,11 @@ jobs:
             artifacts/*.snupkg
           if-no-files-found: error
 
-      # Everything below only runs for pushes to main - other branches/PRs stop here.
-      - name: Is main push?
+      # Everything below only runs for pushes to the default branch - other
+      # branches/PRs stop here. This repo's default branch is wip-0.1.0, not main.
+      - name: Is default-branch push?
         id: ismain
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/wip-0.1.0'
         run: echo "yes=true" >> "$GITHUB_OUTPUT"
 
       # The .csproj <Version> is the single source of truth: it's what the
