@@ -7,6 +7,7 @@ public sealed class TransformBlockTests
     private sealed class RecordingTarget<T> : IFluxTarget<T>
     {
         private readonly TaskCompletionSource _completionTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private volatile bool _declining;
 
         public List<T> Received { get; } = [];
         public bool Completed { get; private set; }
@@ -18,6 +19,10 @@ public sealed class TransformBlockTests
 
         public bool TryOffer(T item)
         {
+            if (_declining)
+            {
+                return false;
+            }
             lock (Received)
             {
                 Received.Add(item);
@@ -28,12 +33,86 @@ public sealed class TransformBlockTests
         public void Complete()
         {
             Completed = true;
+            _declining = true;
             _completionTcs.TrySetResult();
         }
 
         public void Fault(Exception exception)
         {
             ArgumentNullException.ThrowIfNull(exception);
+            _declining = true;
+            _completionTcs.TrySetException(exception);
+        }
+    }
+
+    /// <summary>
+    /// A target that starts unable to accept anything - both <see cref="TryOffer"/> and any parked
+    /// <see cref="SendAsync"/> decline/wait - until <see cref="Open"/> is called, at which point it accepts every
+    /// item unconditionally. Models a target that is transiently full, as opposed to <see cref="RecordingTarget{T}"/>'s
+    /// <see cref="RecordingTarget{T}.Complete"/>/<see cref="RecordingTarget{T}.Fault"/> which model a target that
+    /// is permanently done - so fan-out tests can exercise the genuinely-awaited second pass in
+    /// <c>BroadcastAsync</c>/<c>FirstAvailableAsync</c>/<c>RoundRobinAsync</c> instead of only their synchronous
+    /// sweep, which every other fan-out test so far only ever hits.
+    /// </summary>
+    private sealed class GateableTarget<T> : IFluxTarget<T>
+    {
+        private readonly TaskCompletionSource _completionTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _openGate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private volatile bool _open;
+        private volatile bool _declining;
+        private int _tryOfferAttempts;
+
+        public List<T> Received { get; } = [];
+
+        public string Name => "GateableTarget";
+        public Task Completion => _completionTcs.Task;
+
+        /// <summary>Number of <see cref="TryOffer"/> calls observed so far, success or decline - lets a test wait for a specific sweep to have actually touched this target before mutating its state.</summary>
+        public int TryOfferAttempts => Volatile.Read(ref _tryOfferAttempts);
+
+        /// <summary>Opens the gate: every future <see cref="TryOffer"/> succeeds, and any parked <see cref="SendAsync"/> wakes to accept.</summary>
+        public void Open()
+        {
+            _open = true;
+            _openGate.TrySetResult();
+        }
+
+        public bool TryOffer(T item)
+        {
+            Interlocked.Increment(ref _tryOfferAttempts);
+            if (_declining || !_open)
+            {
+                return false;
+            }
+            lock (Received)
+            {
+                Received.Add(item);
+            }
+            return true;
+        }
+
+        public async ValueTask<bool> SendAsync(T item, CancellationToken cancellationToken = default)
+        {
+            if (TryOffer(item))
+            {
+                return true;
+            }
+            await _openGate.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            return TryOffer(item);
+        }
+
+        public void Complete()
+        {
+            _declining = true;
+            _openGate.TrySetResult();
+            _completionTcs.TrySetResult();
+        }
+
+        public void Fault(Exception exception)
+        {
+            ArgumentNullException.ThrowIfNull(exception);
+            _declining = true;
+            _openGate.TrySetResult();
             _completionTcs.TrySetException(exception);
         }
     }
@@ -47,6 +126,15 @@ public sealed class TransformBlockTests
 
     private static void Release(ConcurrentDictionary<int, TaskCompletionSource> gates, int item)
         => gates.GetOrAdd(item, static _ => new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)).SetResult();
+
+    private static async Task WaitUntilAsync(Func<bool> condition, CancellationToken cancellationToken)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(2);
+        while (!condition() && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(5, cancellationToken);
+        }
+    }
 
     // ───────────────────────────────────────────────
     //  Construction
@@ -254,11 +342,11 @@ public sealed class TransformBlockTests
     }
 
     [Fact]
-    public void LinkTo_SecondLinkWhileActive_Throws()
+    public void LinkTo_SecondLinkWhileActive_DoesNotThrow()
     {
         var block = new TransformBlock<int, int>(item => item);
-        using var link = block.LinkTo(new RecordingTarget<int>());
-        Assert.Throws<InvalidOperationException>(() => block.LinkTo(new RecordingTarget<int>()));
+        using var link1 = block.LinkTo(new RecordingTarget<int>());
+        using var link2 = block.LinkTo(new RecordingTarget<int>());
     }
 
     [Fact]
@@ -286,6 +374,332 @@ public sealed class TransformBlockTests
         await target.Completion;
 
         Assert.Equal([2, 4], target.Received);
+    }
+
+    // ───────────────────────────────────────────────
+    //  Fan-out (multi-link dispatch)
+    // ───────────────────────────────────────────────
+
+    [Fact]
+    public void LinkTo_SameTargetTwiceWithDifferentFilters_DoesNotThrow()
+    {
+        var block = new TransformBlock<int, int>(item => item);
+        var target = new RecordingTarget<int>();
+        using var link1 = block.LinkTo(target, filter: i => i % 2 == 0);
+        using var link2 = block.LinkTo(target, filter: i => i % 2 != 0);
+    }
+
+    [Fact]
+    public async Task LinkTo_Broadcast_DuplicatesToEveryLinkedTarget()
+    {
+        var block = new TransformBlock<int, int>(item => item);
+        var targetA = new RecordingTarget<int>();
+        var targetB = new RecordingTarget<int>();
+        using var linkA = block.LinkTo(targetA);
+        using var linkB = block.LinkTo(targetB);
+
+        await block.SendAsync(1, TestContext.Current.CancellationToken);
+        await block.SendAsync(2, TestContext.Current.CancellationToken);
+        block.Complete();
+
+        await block.Completion;
+        await targetA.Completion;
+        await targetB.Completion;
+
+        Assert.Equal([1, 2], targetA.Received);
+        Assert.Equal([1, 2], targetB.Received);
+    }
+
+    [Fact]
+    public async Task LinkTo_Broadcast_PerLinkFilter_RoutesOnlyMatchingItems()
+    {
+        var block = new TransformBlock<int, int>(item => item);
+        var evens = new RecordingTarget<int>();
+        var odds = new RecordingTarget<int>();
+        using var linkEvens = block.LinkTo(evens, filter: i => i % 2 == 0);
+        using var linkOdds = block.LinkTo(odds, filter: i => i % 2 != 0);
+
+        foreach (var i in Enumerable.Range(1, 4))
+        {
+            await block.SendAsync(i, TestContext.Current.CancellationToken);
+        }
+        block.Complete();
+
+        await block.Completion;
+        await evens.Completion;
+        await odds.Completion;
+
+        Assert.Equal([2, 4], evens.Received);
+        Assert.Equal([1, 3], odds.Received);
+    }
+
+    [Fact]
+    public async Task LinkTo_FirstAvailable_OnlyFirstLinkedTargetReceivesEachItem()
+    {
+        var block = new TransformBlock<int, int>(item => item, new FluxBlockOptions { FanOutMode = FluxFanOutMode.FirstAvailable });
+        var first = new RecordingTarget<int>();
+        var second = new RecordingTarget<int>();
+        using var linkFirst = block.LinkTo(first);
+        using var linkSecond = block.LinkTo(second);
+
+        await block.SendAsync(1, TestContext.Current.CancellationToken);
+        await block.SendAsync(2, TestContext.Current.CancellationToken);
+        block.Complete();
+
+        await block.Completion;
+        await first.Completion;
+        await second.Completion;
+
+        Assert.Equal([1, 2], first.Received);
+        Assert.Empty(second.Received);
+    }
+
+    [Fact]
+    public async Task LinkTo_FirstAvailable_PermanentlyDoneHigherPriorityLink_FailsOverToNext()
+    {
+        var block = new TransformBlock<int, int>(item => item, new FluxBlockOptions { FanOutMode = FluxFanOutMode.FirstAvailable });
+        var first = new RecordingTarget<int>();
+        var second = new RecordingTarget<int>();
+        using var linkFirst = block.LinkTo(first);
+        using var linkSecond = block.LinkTo(second);
+
+        first.Complete(); // retire the higher-priority target before any items flow
+
+        await block.SendAsync(1, TestContext.Current.CancellationToken);
+        await block.SendAsync(2, TestContext.Current.CancellationToken);
+        block.Complete();
+
+        await block.Completion;
+        await second.Completion;
+
+        Assert.Empty(first.Received);
+        Assert.Equal([1, 2], second.Received);
+    }
+
+    [Fact]
+    public async Task LinkTo_RoundRobin_AlternatesAcrossTargets_WhenBothAlwaysFree()
+    {
+        var block = new TransformBlock<int, int>(item => item, new FluxBlockOptions { FanOutMode = FluxFanOutMode.RoundRobin });
+        var targetA = new RecordingTarget<int>();
+        var targetB = new RecordingTarget<int>();
+        using var linkA = block.LinkTo(targetA);
+        using var linkB = block.LinkTo(targetB);
+
+        const int itemCount = 20;
+        for (var i = 0; i < itemCount; i++)
+        {
+            await block.SendAsync(i, TestContext.Current.CancellationToken);
+        }
+        block.Complete();
+
+        await block.Completion;
+        await targetA.Completion;
+        await targetB.Completion;
+
+        // No drops, no duplicates.
+        Assert.Equal(itemCount, targetA.Received.Count + targetB.Received.Count);
+        Assert.Empty(targetA.Received.Intersect(targetB.Received));
+        // Both targets always have room and MaxDegreeOfParallelism defaults to 1 (strict output order), so the
+        // rotating cursor deterministically alternates evenly between exactly two always-free targets.
+        Assert.Equal(itemCount / 2, targetA.Received.Count);
+        Assert.Equal(itemCount / 2, targetB.Received.Count);
+    }
+
+    [Fact]
+    public async Task LinkTo_Broadcast_TransientlyFullTarget_StillReceivesOnceItOpens_WithoutBlockingOtherTarget()
+    {
+        var block = new TransformBlock<int, int>(item => item);
+        var fast = new RecordingTarget<int>();
+        var slow = new GateableTarget<int>(); // starts closed: synchronous TryOffer declines until Open()
+        using var linkFast = block.LinkTo(fast);
+        using var linkSlow = block.LinkTo(slow);
+
+        await block.SendAsync(1, TestContext.Current.CancellationToken);
+        block.Complete();
+
+        // BroadcastAsync's synchronous sweep runs fast's TryOffer to completion before it ever awaits slow's
+        // SendAsync (the pending-array promotion only happens for links that declined synchronously), so fast
+        // must already have the item well before slow's gate opens - this is not a race.
+        await WaitUntilAsync(() => fast.Received.Count > 0, TestContext.Current.CancellationToken);
+        Assert.Equal([1], fast.Received);
+        Assert.Empty(slow.Received); // still parked awaiting slow's gate, but not dropped
+
+        slow.Open();
+
+        await block.Completion;
+        await fast.Completion;
+        await slow.Completion;
+
+        Assert.Equal([1], fast.Received);
+        Assert.Equal([1], slow.Received);
+    }
+
+    [Fact]
+    public async Task LinkTo_FirstAvailable_TransientlyFullHigherPriorityLink_IsWaitedOn_NotSkippedForLowerPriorityLinkThatOpensFirst()
+    {
+        var block = new TransformBlock<int, int>(item => item, new FluxBlockOptions { FanOutMode = FluxFanOutMode.FirstAvailable });
+        var first = new GateableTarget<int>();
+        var second = new GateableTarget<int>();
+        using var linkFirst = block.LinkTo(first);
+        using var linkSecond = block.LinkTo(second);
+
+        await block.SendAsync(1, TestContext.Current.CancellationToken);
+        block.Complete();
+
+        // Wait for the synchronous sweep to have actually tried (and declined) both links before touching
+        // either target's state - opening `second` too early would let it win during the sweep itself instead
+        // of exercising the awaiting second pass this test targets.
+        await WaitUntilAsync(() => first.TryOfferAttempts > 0 && second.TryOfferAttempts > 0, TestContext.Current.CancellationToken);
+
+        second.Open();
+        await Task.Delay(30, TestContext.Current.CancellationToken);
+        Assert.Empty(first.Received);
+        Assert.Empty(second.Received); // second is open, but dispatch is still parked awaiting `first` specifically - link order is priority order even while waiting
+
+        first.Open();
+
+        await block.Completion;
+        await first.Completion;
+        await second.Completion;
+
+        Assert.Equal([1], first.Received);
+        Assert.Empty(second.Received);
+    }
+
+    [Fact]
+    public async Task LinkTo_FirstAvailable_HigherPriorityLinkFaultsWhileAwaited_FailsOverToNext()
+    {
+        var block = new TransformBlock<int, int>(item => item, new FluxBlockOptions { FanOutMode = FluxFanOutMode.FirstAvailable });
+        var first = new GateableTarget<int>();
+        var second = new GateableTarget<int>();
+        using var linkFirst = block.LinkTo(first);
+        using var linkSecond = block.LinkTo(second);
+
+        await block.SendAsync(1, TestContext.Current.CancellationToken);
+        block.Complete();
+
+        await WaitUntilAsync(() => first.TryOfferAttempts > 0 && second.TryOfferAttempts > 0, TestContext.Current.CancellationToken);
+
+        second.Open(); // second is free now, but dispatch is still parked awaiting `first`'s SendAsync specifically
+        first.Fault(new InvalidOperationException("first died mid-wait")); // wakes first's SendAsync -> resolves false -> failover to second
+
+        await block.Completion;
+        await second.Completion;
+
+        Assert.Empty(first.Received);
+        Assert.Equal([1], second.Received);
+    }
+
+    [Fact]
+    public async Task LinkTo_RoundRobin_TransientlyFullTargetAtRotatedStart_IsWaitedOn_NotSkipped()
+    {
+        var block = new TransformBlock<int, int>(item => item, new FluxBlockOptions { FanOutMode = FluxFanOutMode.RoundRobin });
+        var first = new GateableTarget<int>();
+        var second = new GateableTarget<int>();
+        using var linkFirst = block.LinkTo(first);
+        using var linkSecond = block.LinkTo(second);
+
+        // The first item's rotating start is index 0 (first) - same priority-during-wait semantic as
+        // FirstAvailable, just reached through RoundRobinAsync's separately-implemented sweep/await passes.
+        await block.SendAsync(1, TestContext.Current.CancellationToken);
+        block.Complete();
+
+        await WaitUntilAsync(() => first.TryOfferAttempts > 0 && second.TryOfferAttempts > 0, TestContext.Current.CancellationToken);
+
+        second.Open();
+        await Task.Delay(30, TestContext.Current.CancellationToken);
+        Assert.Empty(second.Received);
+
+        first.Open();
+
+        await block.Completion;
+        await first.Completion;
+        await second.Completion;
+
+        Assert.Equal([1], first.Received);
+        Assert.Empty(second.Received);
+    }
+
+    [Fact]
+    public async Task LinkTo_FirstAvailable_PerLinkFilter_SkipsNonMatchingHigherPriorityLink()
+    {
+        var block = new TransformBlock<int, int>(item => item, new FluxBlockOptions { FanOutMode = FluxFanOutMode.FirstAvailable });
+        var evensOnly = new RecordingTarget<int>();
+        var catchAll = new RecordingTarget<int>();
+        using var linkEvens = block.LinkTo(evensOnly, filter: i => i % 2 == 0); // higher priority, but only matches evens
+        using var linkCatchAll = block.LinkTo(catchAll);
+
+        await block.SendAsync(1, TestContext.Current.CancellationToken); // odd -> must skip evensOnly entirely
+        await block.SendAsync(2, TestContext.Current.CancellationToken); // even -> evensOnly wins despite the filter check
+        block.Complete();
+
+        await block.Completion;
+        await evensOnly.Completion;
+        await catchAll.Completion;
+
+        Assert.Equal([2], evensOnly.Received);
+        Assert.Equal([1], catchAll.Received);
+    }
+
+    [Fact]
+    public async Task LinkTo_RoundRobin_PerLinkFilter_OnlyRoutesToMatchingTarget()
+    {
+        var block = new TransformBlock<int, int>(item => item, new FluxBlockOptions { FanOutMode = FluxFanOutMode.RoundRobin });
+        var evens = new RecordingTarget<int>();
+        var odds = new RecordingTarget<int>();
+        using var linkEvens = block.LinkTo(evens, filter: i => i % 2 == 0);
+        using var linkOdds = block.LinkTo(odds, filter: i => i % 2 != 0);
+
+        foreach (var i in Enumerable.Range(1, 6))
+        {
+            await block.SendAsync(i, TestContext.Current.CancellationToken);
+        }
+        block.Complete();
+
+        await block.Completion;
+        await evens.Completion;
+        await odds.Completion;
+
+        // Disjoint filters partition every item to exactly one target regardless of the rotating cursor - the
+        // filter check happens before a candidate is even considered for TryOffer/SendAsync.
+        Assert.Equal([2, 4, 6], evens.Received);
+        Assert.Equal([1, 3, 5], odds.Received);
+    }
+
+    [Fact]
+    public async Task Complete_MultiLink_PropagatesToEveryLinkedTarget()
+    {
+        var block = new TransformBlock<int, int>(item => item);
+        var targetA = new RecordingTarget<int>();
+        var targetB = new RecordingTarget<int>();
+        using var linkA = block.LinkTo(targetA);
+        using var linkB = block.LinkTo(targetB);
+
+        block.Complete();
+
+        await targetA.Completion;
+        await targetB.Completion;
+
+        Assert.True(targetA.Completed);
+        Assert.True(targetB.Completed);
+    }
+
+    [Fact]
+    public async Task Fault_MultiLink_PropagatesToEveryLinkedTarget()
+    {
+        var block = new TransformBlock<int, int>(item => item);
+        var targetA = new RecordingTarget<int>();
+        var targetB = new RecordingTarget<int>();
+        using var linkA = block.LinkTo(targetA);
+        using var linkB = block.LinkTo(targetB);
+
+        var exception = new InvalidOperationException("boom");
+        block.Fault(exception);
+
+        var thrownA = await Assert.ThrowsAsync<InvalidOperationException>(async () => await targetA.Completion);
+        var thrownB = await Assert.ThrowsAsync<InvalidOperationException>(async () => await targetB.Completion);
+        Assert.Same(exception, thrownA);
+        Assert.Same(exception, thrownB);
     }
 
     // ───────────────────────────────────────────────

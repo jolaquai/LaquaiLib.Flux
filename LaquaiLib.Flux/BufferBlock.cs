@@ -15,6 +15,6 @@ public sealed class BufferBlock<T> : PropagatorFluxBlockBase<T, T>
     public BufferBlock(FluxBlockOptions options = null)
         : base(options, inputSingleReader: true, outputSingleWriter: true)
     {
-        throw new NotImplementedException("BufferBlock<T> is a v1 surface stub; full implementation lands in a follow-up pass.");
+        throw new NotImplementedException("BufferBlock<T> is not yet implemented.");
     }
 }

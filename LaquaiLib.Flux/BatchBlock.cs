@@ -30,6 +30,6 @@ public sealed class BatchBlock<T> : PropagatorFluxBlockBase<T, T[]>
         : base(options, inputSingleReader: true, outputSingleWriter: true)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(batchSize, 1);
-        throw new NotImplementedException("BatchBlock<T> is a v1 surface stub; full implementation lands in a follow-up pass.");
+        throw new NotImplementedException("BatchBlock<T> is not yet implemented.");
     }
 }

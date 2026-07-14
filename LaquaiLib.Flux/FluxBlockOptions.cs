@@ -46,4 +46,14 @@ public sealed class FluxBlockOptions
     /// <c>"{TypeName}-{instance counter}"</c> is assigned at construction.
     /// </summary>
     public string Name { get; init; }
+
+    /// <summary>
+    /// Gets or sets how a block with more than one active link (see <see cref="IFluxSource{TOut}.LinkTo"/>)
+    /// dispatches each produced item. Defaults to <see cref="FluxFanOutMode.Broadcast"/>. Has no observable
+    /// effect while 0 or 1 links are active. Construction-time and immutable for the block's lifetime, like
+    /// <see cref="EnsureOrdered"/> and <see cref="MaxDegreeOfParallelism"/>: the dispatch loop reads this once
+    /// per item against a concurrently-mutating link set, so changing it mid-flight would be a correctness
+    /// hazard for no real benefit.
+    /// </summary>
+    public FluxFanOutMode FanOutMode { get; init; } = FluxFanOutMode.Broadcast;
 }

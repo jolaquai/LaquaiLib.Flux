@@ -1,10 +1,27 @@
 namespace LaquaiLib.Flux.Diagnostics;
 
 /// <summary>
+/// Public discovery info for the <see cref="Meter"/> every Flux block reports metrics through. A deliberately
+/// separate public type rather than making <see cref="FluxMetrics"/> itself public: the actual instrument objects
+/// (<see cref="Counter{T}"/>, <see cref="Histogram{T}"/>, <see cref="ObservableGauge{T}"/>) stay internal so
+/// nothing outside this assembly can write to them directly, while external wiring - an OpenTelemetry exporter's
+/// <c>AddMeter</c> call, a <c>dotnet-counters</c> config file - can still reference the meter by name without
+/// hardcoding a magic string that would silently drift if it ever changed.
+/// </summary>
+public static class FluxMeter
+{
+    /// <summary>The name under which Flux's shared <see cref="Meter"/> is registered. Equivalent to <see cref="FluxMetrics.MeterName"/>.</summary>
+    public const string Name = FluxMetrics.MeterName;
+
+    /// <summary>The version tagged on Flux's shared <see cref="Meter"/>. Equivalent to <see cref="FluxMetrics.MeterVersion"/>.</summary>
+    public const string Version = FluxMetrics.MeterVersion;
+}
+
+/// <summary>
 /// Holds the process-wide <see cref="Meter"/> and every instrument Flux blocks report through. The meter is a
 /// <see langword="static readonly"/> singleton created unconditionally at type load, not behind any opt-in flag,
 /// so <c>dotnet-counters monitor LaquaiLib.Flux</c> or any OpenTelemetry <see cref="Meter"/>-name-based exporter
-/// picks these up with zero extra configuration.
+/// picks these up with zero extra configuration. See <see cref="FluxMeter"/> for the public-facing name/version.
 /// </summary>
 internal static class FluxMetrics
 {
@@ -20,8 +37,8 @@ internal static class FluxMetrics
     /// <summary>The shared <see cref="Meter"/> instance every Flux block instrument is created from.</summary>
     public static readonly Meter Meter = new(MeterName, MeterVersion);
 
-    /// <summary>Items accepted by a block via <see cref="IFluxTarget{TIn}.SendAsync"/>.</summary>
-    public static readonly Counter<long> ItemsAccepted = Meter.CreateCounter<long>("flux.block.items_accepted", unit: "{item}", description: "Items accepted via SendAsync.");
+    /// <summary>Items accepted by a block via <see cref="IFluxTarget{TIn}.SendAsync"/> or <see cref="IFluxTarget{TIn}.TryOffer"/>.</summary>
+    public static readonly Counter<long> ItemsAccepted = Meter.CreateCounter<long>("flux.block.items_accepted", unit: "{item}", description: "Items accepted via SendAsync or TryOffer.");
 
     /// <summary>Items that finished processing within a block (transform/action completed).</summary>
     public static readonly Counter<long> ItemsProcessed = Meter.CreateCounter<long>("flux.block.items_processed", unit: "{item}", description: "Items that finished processing.");

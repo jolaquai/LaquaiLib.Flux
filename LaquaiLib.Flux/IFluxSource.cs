@@ -11,15 +11,21 @@ public interface IFluxSource<out TOut> : IFluxBlock
     /// Links this source's output to <paramref name="target"/>, so every produced item is pushed to it directly
     /// instead of requiring a manual <see cref="ReceiveAllAsync"/> consumer loop.
     /// <para/>
-    /// v1 restriction: a source may have at most one active link at a time. Calling this while a link is already
-    /// active throws; dispose the <see cref="IDisposable"/> returned by the prior call first.
+    /// Multiple links may be active on the same source simultaneously (including more than one link to the same
+    /// <paramref name="target"/> instance, e.g. distinguished only by <paramref name="filter"/>). Once more than
+    /// one link is active, <see cref="FluxBlockOptions.FanOutMode"/> determines how each produced item is routed
+    /// across them; with 0 or 1 links active, behavior is unaffected by that setting.
     /// </summary>
     /// <param name="target">The target to link to.</param>
     /// <param name="linkOptions">Options controlling completion propagation for this link. <see langword="null"/> uses <see cref="FluxLinkOptions.Default"/>.</param>
+    /// <param name="filter">
+    /// An optional predicate an item must satisfy to be routed to <paramref name="target"/> via this link.
+    /// <see langword="null"/> (the default) matches every item. An item matching no active link's filter is
+    /// dropped, same as a link whose target has permanently completed or faulted.
+    /// </param>
     /// <returns>An <see cref="IDisposable"/> that, when disposed, unlinks <paramref name="target"/> from this source.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="target"/> is <see langword="null"/>.</exception>
-    /// <exception cref="InvalidOperationException">This source already has an active link. v1 permits exactly one linked target per source.</exception>
-    public IDisposable LinkTo(IFluxTarget<TOut> target, FluxLinkOptions linkOptions = null);
+    public IDisposable LinkTo(IFluxTarget<TOut> target, FluxLinkOptions linkOptions = null, Func<TOut, bool> filter = null);
 
     /// <summary>
     /// Returns an <see cref="IAsyncEnumerable{T}"/> that pulls items directly from this source, bypassing the
