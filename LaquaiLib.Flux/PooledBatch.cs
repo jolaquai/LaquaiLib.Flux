@@ -9,8 +9,7 @@ namespace LaquaiLib.Flux;
 /// the backing array may already have been re-rented to an unrelated caller by then. Disposing more than once is
 /// undefined behavior: the same array could be returned to the pool twice, so two unrelated future rents could
 /// alias the same array. If a batch's data needs to outlive disposal (or outlive the batch being handed to more
-/// than one owner, e.g. a <see cref="FluxFanOutMode.Broadcast"/> link), call <see cref="Memory"/>.ToArray() (or
-/// <see cref="Span"/>.ToArray()) to snapshot it into an owned, GC-managed array first.
+/// than one owner), use <see cref="ToArray"/>.
 /// <para/>
 /// This is a mutable, mutable-underlying-array struct, not a <c>ReadOnly</c> view: a given rented array is handed
 /// to exactly one logical owner under normal (non-broadcast) routing. See <see cref="BatchBlock{T}"/>'s remarks
@@ -60,6 +59,12 @@ public readonly struct PooledBatch<T> : IDisposable
             return _array[index];
         }
     }
+
+    /// <summary>
+    /// Copies the elements of this batch into a new array of <typeparamref name="T"/> and returns that array.
+    /// </summary>
+    /// <returns>The created array containing the elements of this batch.</returns>
+    public T[] ToArray() => Span.ToArray();
 
     /// <summary>
     /// Returns this batch's backing array to <see cref="ArrayPool{T}.Shared"/>. Must be called exactly once; see
