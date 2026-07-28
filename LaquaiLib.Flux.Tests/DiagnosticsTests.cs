@@ -192,6 +192,30 @@ public sealed class DiagnosticsTests
     }
 
     [Fact]
+    public async Task ItemsProcessed_BufferBlock_RecordsOnePerItemDespiteHavingNoProcessingLoop()
+    {
+        // BufferBlock is a pure passthrough with a single channel and no pump loop to report from, so accepting
+        // is what counts as processing for it. Without that, a pipeline's per-stage throughput would show a hole
+        // wherever a buffer sits.
+        var blockName = nameof(ItemsProcessed_BufferBlock_RecordsOnePerItemDespiteHavingNoProcessingLoop);
+        using var capture = new MetricsCapture();
+
+        var block = new BufferBlock<int>(new FluxBlockOptions { Name = blockName });
+        for (var i = 0; i < 5; i++)
+        {
+            await block.SendAsync(i, TestContext.Current.CancellationToken);
+        }
+        block.Complete();
+        await foreach (var _ in block.ReceiveAllAsync(TestContext.Current.CancellationToken))
+        {
+        }
+        await block.Completion;
+
+        var processed = capture.Longs.Count(m => m.Instrument == FluxMetrics.ItemsProcessed && m.BlockName == blockName);
+        Assert.Equal(5, processed);
+    }
+
+    [Fact]
     public async Task ItemsDropped_RecordsWhenNoLinkedFilterMatches()
     {
         var blockName = nameof(ItemsDropped_RecordsWhenNoLinkedFilterMatches);

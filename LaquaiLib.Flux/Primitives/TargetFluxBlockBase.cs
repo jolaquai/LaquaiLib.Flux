@@ -38,14 +38,23 @@ public abstract class TargetFluxBlockBase<TIn> : IFluxTarget<TIn>
     private readonly TaskCompletionSource _completionTcs;
     private Exception _fault;
 
+    /// <summary>
+    /// Whether accepting an item should also count as processing it. Set only by a pure passthrough block, which
+    /// has no processing loop of its own to report <see cref="FluxMetrics.ItemsProcessed"/> from, yet must not
+    /// leave a hole in the "every stage reports throughput" contract. For such a block the two counts are
+    /// identical by definition.
+    /// </summary>
+    private readonly bool _countAcceptedAsProcessed;
+
     /// <inheritdoc/>
     public string Name { get; }
 
     /// <inheritdoc/>
     public Task Completion => _completionTcs.Task;
 
-    private protected TargetFluxBlockBase(FluxBlockOptions options, bool singleReader)
+    private protected TargetFluxBlockBase(FluxBlockOptions options, bool singleReader, bool countAcceptedAsProcessed = false)
     {
+        _countAcceptedAsProcessed = countAcceptedAsProcessed;
         _options = options ?? FluxBlockOptions.Default;
         Name = _options.Name ?? FluxNameGenerator.Generate(GetType());
         _tags = new TagList { { "flux.block.name", Name } };
@@ -88,6 +97,12 @@ public abstract class TargetFluxBlockBase<TIn> : IFluxTarget<TIn>
             {
                 FluxMetrics.ItemsAccepted.Add(1, _tags);
             }
+            // Field first: it is false for every block but a passthrough, so this stays a predicted-not-taken
+            // branch that never even loads the instrument.
+            if (_countAcceptedAsProcessed && FluxMetrics.ItemsProcessed.Enabled)
+            {
+                FluxMetrics.ItemsProcessed.Add(1, _tags);
+            }
             return true;
         }
         return false;
@@ -116,7 +131,12 @@ public abstract class TargetFluxBlockBase<TIn> : IFluxTarget<TIn>
     public void Complete() => _input.Writer.TryComplete();
 
     /// <inheritdoc/>
-    public void Fault(Exception exception)
+    /// <remarks>
+    /// <see langword="virtual"/> purely so a block whose read loop is not the thing that discards its queued items
+    /// can add that discard here; this is a cold, once-per-block path, so the virtual dispatch costs nothing that
+    /// matters. Overrides must call <see langword="base"/>.
+    /// </remarks>
+    public virtual void Fault(Exception exception)
     {
         ArgumentNullException.ThrowIfNull(exception);
         TrySetFault(exception);

@@ -113,6 +113,183 @@ public sealed class BufferBlockTests
     }
 
     // ─────────────────────────────────────────────
+    //  Fan-out and link management
+    //
+    //  The fan-out logic itself lives in PropagatorFluxBlockBase and is covered exhaustively by
+    //  TransformBlockTests. It is re-covered here because BufferBlock is the one block whose dispatch loop reads
+    //  the very same channel its producers write to, so "the dispatch loop sees every produced item" is a
+    //  structurally different claim for it than for every other block.
+    // ─────────────────────────────────────────────
+
+    [Fact]
+    public async Task LinkTo_Broadcast_MultiLink_EveryTargetReceivesEveryItem()
+    {
+        var block = new BufferBlock<int>(new FluxBlockOptions { FanOutMode = FluxFanOutMode.Broadcast });
+        var first = new RecordingTarget<int>();
+        var second = new RecordingTarget<int>();
+        using var linkA = block.LinkTo(first);
+        using var linkB = block.LinkTo(second);
+
+        for (var i = 0; i < 3; i++)
+        {
+            await block.SendAsync(i, TestContext.Current.CancellationToken);
+        }
+        block.Complete();
+
+        await first.Completion;
+        await second.Completion;
+
+        Assert.Equal([0, 1, 2], first.Received);
+        Assert.Equal([0, 1, 2], second.Received);
+    }
+
+    [Fact]
+    public async Task LinkTo_RoundRobin_MultiLink_DistributesAcrossTargets()
+    {
+        var block = new BufferBlock<int>(new FluxBlockOptions { FanOutMode = FluxFanOutMode.RoundRobin });
+        var first = new RecordingTarget<int>();
+        var second = new RecordingTarget<int>();
+        using var linkA = block.LinkTo(first);
+        using var linkB = block.LinkTo(second);
+
+        for (var i = 0; i < 4; i++)
+        {
+            await block.SendAsync(i, TestContext.Current.CancellationToken);
+        }
+        block.Complete();
+
+        await first.Completion;
+        await second.Completion;
+
+        // Both targets always accept synchronously, so the rotating cursor alternates deterministically.
+        Assert.Equal([0, 2], first.Received);
+        Assert.Equal([1, 3], second.Received);
+    }
+
+    [Fact]
+    public async Task LinkTo_FirstAvailable_MultiLink_HighestPriorityTargetTakesEverything()
+    {
+        var block = new BufferBlock<int>(new FluxBlockOptions { FanOutMode = FluxFanOutMode.FirstAvailable });
+        var primary = new RecordingTarget<int>();
+        var fallback = new RecordingTarget<int>();
+        using var linkA = block.LinkTo(primary);
+        using var linkB = block.LinkTo(fallback);
+
+        for (var i = 0; i < 3; i++)
+        {
+            await block.SendAsync(i, TestContext.Current.CancellationToken);
+        }
+        block.Complete();
+
+        await primary.Completion;
+        await fallback.Completion;
+
+        Assert.Equal([0, 1, 2], primary.Received);
+        Assert.Empty(fallback.Received);
+    }
+
+    [Fact]
+    public async Task LinkTo_PerLinkFilter_RoutesOnlyMatchingItemsToEachTarget()
+    {
+        var block = new BufferBlock<int>(new FluxBlockOptions { FanOutMode = FluxFanOutMode.Broadcast });
+        var evens = new RecordingTarget<int>();
+        var odds = new RecordingTarget<int>();
+        using var linkA = block.LinkTo(evens, filter: static i => i % 2 == 0);
+        using var linkB = block.LinkTo(odds, filter: static i => i % 2 != 0);
+
+        for (var i = 0; i < 6; i++)
+        {
+            await block.SendAsync(i, TestContext.Current.CancellationToken);
+        }
+        block.Complete();
+
+        await evens.Completion;
+        await odds.Completion;
+
+        Assert.Equal([0, 2, 4], evens.Received);
+        Assert.Equal([1, 3, 5], odds.Received);
+    }
+
+    [Fact]
+    public async Task LinkTo_AfterItemsAlreadyBuffered_DispatchDrainsTheBacklog()
+    {
+        // The dispatch loop only starts on the first LinkTo, and with one shared channel the backlog it has to
+        // pick up is sitting in the very channel producers wrote to.
+        var block = new BufferBlock<int>();
+        for (var i = 0; i < 4; i++)
+        {
+            await block.SendAsync(i, TestContext.Current.CancellationToken);
+        }
+
+        var target = new RecordingTarget<int>();
+        using var link = block.LinkTo(target);
+        block.Complete();
+
+        await target.Completion;
+        Assert.Equal([0, 1, 2, 3], target.Received);
+    }
+
+    [Fact]
+    public async Task LinkTo_UnlinkedMidStream_StopsReceiving_AndARelinkedTargetResumes()
+    {
+        var block = new BufferBlock<int>();
+        var first = new RecordingTarget<int>();
+        var link = block.LinkTo(first);
+
+        await block.SendAsync(1, TestContext.Current.CancellationToken);
+        await WaitUntilAsync(() => first.Received.Count == 1, TestContext.Current.CancellationToken);
+        link.Dispose();
+
+        var second = new RecordingTarget<int>();
+        using var relink = block.LinkTo(second);
+        await block.SendAsync(2, TestContext.Current.CancellationToken);
+        block.Complete();
+
+        await second.Completion;
+        Assert.Equal([1], first.Received);
+        Assert.Equal([2], second.Received);
+    }
+
+    [Fact]
+    public async Task SendAsync_ConcurrentProducers_EveryItemArrivesExactlyOnce()
+    {
+        // The shared channel is written by arbitrary producers and read directly by the consumer, so its
+        // multi-writer configuration is doing real work here that a pump loop used to hide.
+        const int producerCount = 8;
+        const int perProducer = 500;
+        var block = new BufferBlock<int>(new FluxBlockOptions { BoundedCapacity = 16 });
+
+        var results = new List<int>();
+        var consume = Task.Run(async () =>
+        {
+            await foreach (var item in block.ReceiveAllAsync(TestContext.Current.CancellationToken))
+            {
+                results.Add(item);
+            }
+        }, TestContext.Current.CancellationToken);
+
+        var producers = new Task[producerCount];
+        for (var p = 0; p < producerCount; p++)
+        {
+            var offset = p * perProducer;
+            producers[p] = Task.Run(async () =>
+            {
+                for (var i = 0; i < perProducer; i++)
+                {
+                    await block.SendAsync(offset + i, TestContext.Current.CancellationToken);
+                }
+            }, TestContext.Current.CancellationToken);
+        }
+
+        await Task.WhenAll(producers);
+        block.Complete();
+        await consume;
+
+        Assert.Equal(producerCount * perProducer, results.Count);
+        Assert.Equal(producerCount * perProducer, results.Distinct().Count());
+    }
+
+    // ─────────────────────────────────────────────
     //  Completion propagation
     // ─────────────────────────────────────────────
 
@@ -158,6 +335,74 @@ public sealed class BufferBlockTests
         block.Fault(ex);
 
         await Assert.ThrowsAsync<InvalidOperationException>(async () => await target.Completion);
+    }
+
+    [Fact]
+    public async Task Complete_ItemsStillBuffered_CompletionPendingUntilDrained()
+    {
+        // The block holds one buffer, so it is not done while that buffer still holds items nobody has taken.
+        // Nothing is linked and nothing is consuming here, so Complete() alone must not resolve Completion.
+        var block = new BufferBlock<int>();
+        await block.SendAsync(1, TestContext.Current.CancellationToken);
+        await block.SendAsync(2, TestContext.Current.CancellationToken);
+        block.Complete();
+
+        var delay = Task.Delay(200, TestContext.Current.CancellationToken);
+        Assert.Same(delay, await Task.WhenAny(block.Completion, delay));
+        Assert.False(block.Completion.IsCompleted);
+
+        var results = new List<int>();
+        await foreach (var item in block.ReceiveAllAsync(TestContext.Current.CancellationToken))
+        {
+            results.Add(item);
+        }
+
+        await block.Completion;
+        Assert.Equal([1, 2], results);
+        Assert.Equal(TaskStatus.RanToCompletion, block.Completion.Status);
+    }
+
+    [Fact]
+    public async Task Fault_ItemsStillBuffered_DiscardsAndResolvesWithoutADrain()
+    {
+        // Unlike Complete, Fault is decisive: IFluxTarget<T>.Fault promises queued items are discarded, and a
+        // bounded channel would otherwise withhold its completion signal until someone drained them.
+        var block = new BufferBlock<int>();
+        await block.SendAsync(1, TestContext.Current.CancellationToken);
+        await block.SendAsync(2, TestContext.Current.CancellationToken);
+
+        var ex = new InvalidOperationException("boom");
+        block.Fault(ex);
+
+        var faulted = await Assert.ThrowsAsync<InvalidOperationException>(async () => await block.Completion);
+        Assert.Same(ex, faulted);
+
+        var results = new List<int>();
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        {
+            await foreach (var item in block.ReceiveAllAsync(TestContext.Current.CancellationToken))
+            {
+                results.Add(item);
+            }
+        });
+        Assert.Empty(results);
+    }
+
+    [Fact]
+    public async Task CancellationToken_CanceledAfterItemsBuffered_CompletionResolvesCanceled()
+    {
+        // Exercises the cancellation path against a live, non-empty channel. There is no pump loop awaiting the
+        // token, so the block's finalizer is the only thing that can observe it - if that ever regresses, this
+        // hangs rather than fails.
+        using var cts = new CancellationTokenSource();
+        var block = new BufferBlock<int>(new FluxBlockOptions { CancellationToken = cts.Token });
+        await block.SendAsync(1, TestContext.Current.CancellationToken);
+        await block.SendAsync(2, TestContext.Current.CancellationToken);
+
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await block.Completion);
+        Assert.Equal(TaskStatus.Canceled, block.Completion.Status);
     }
 
     // ─────────────────────────────────────────────

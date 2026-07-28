@@ -42,16 +42,44 @@ public abstract class PropagatorFluxBlockBase<TIn, TOut> : TargetFluxBlockBase<T
     // _output (constructed with SingleReader = true), so exactly one thread ever touches this.
     private int _rrCursor;
 
-    private protected PropagatorFluxBlockBase(FluxBlockOptions options, bool inputSingleReader, bool outputSingleWriter)
-        : base(options, inputSingleReader)
+    /// <param name="options">Options controlling capacity and diagnostics.</param>
+    /// <param name="inputSingleReader">Whether exactly one loop ever reads <see cref="TargetFluxBlockBase{TIn}._input"/>.</param>
+    /// <param name="outputSingleWriter">
+    /// Whether exactly one loop ever writes <see cref="_output"/>, non-concurrently. <b>Ignored</b> when
+    /// <paramref name="aliasOutputToInput"/> is set: the shared channel's writer settings then come entirely from
+    /// the input channel, which is always multi-writer because arbitrary producers send to it.
+    /// </param>
+    /// <param name="aliasOutputToInput">
+    /// Whether <see cref="_output"/> should be the very same channel object as
+    /// <see cref="TargetFluxBlockBase{TIn}._input"/> rather than a second one. Valid only when
+    /// <typeparamref name="TIn"/> and <typeparamref name="TOut"/> are the same type, and only meaningful for a
+    /// block that does no work between input and output - a second channel plus a loop moving items into it would
+    /// then buy nothing but a per-item enqueue/dequeue and a second buffer's worth of capacity and allocation.
+    /// <para/>
+    /// Deliberately not a general pattern: any block that actually transforms, batches, or otherwise decouples
+    /// its input rate from its output rate needs the two channels to apply backpressure independently.
+    /// </param>
+    /// <param name="countAcceptedAsProcessed"><inheritdoc cref="TargetFluxBlockBase{TIn}._countAcceptedAsProcessed" path="/summary"/></param>
+    private protected PropagatorFluxBlockBase(FluxBlockOptions options, bool inputSingleReader, bool outputSingleWriter, bool aliasOutputToInput = false, bool countAcceptedAsProcessed = false)
+        : base(options, inputSingleReader, countAcceptedAsProcessed)
     {
-        _output = Channel.CreateBounded<TOut>(new BoundedChannelOptions(_options.BoundedCapacity)
+        if (aliasOutputToInput)
         {
-            SingleReader = true,
-            SingleWriter = outputSingleWriter,
-            FullMode = BoundedChannelFullMode.Wait,
-        });
+            Debug.Assert(typeof(TIn) == typeof(TOut), $"{nameof(aliasOutputToInput)} requires TIn == TOut.");
+            _output = (Channel<TOut>)(object)_input;
+        }
+        else
+        {
+            _output = Channel.CreateBounded<TOut>(new BoundedChannelOptions(_options.BoundedCapacity)
+            {
+                SingleReader = true,
+                SingleWriter = outputSingleWriter,
+                FullMode = BoundedChannelFullMode.Wait,
+            });
+        }
 
+        // Registered even when aliased: input depth and output depth genuinely are the same number then, because
+        // there genuinely is only one buffer.
         FluxBlockDiagnostics.RegisterOutput(Name, _output.Reader);
     }
 

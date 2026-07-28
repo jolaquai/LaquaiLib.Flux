@@ -425,18 +425,54 @@ loses on time **when the per-item work is trivial enough that channel plumbing i
   `BoundedCapacity = 1_000`, but 179 KB at `1_000_000` - the channel's internal deque doubling to hold the
   backlog. Benchmarks that pair a huge capacity with a burst producer are measuring deque growth, not the block.
 
-## Open decision: single-channel `BufferBlock`
+## Resolved: single-channel `BufferBlock` (built)
 
 The "out of scope (noted, not built)" item above was explicitly gated on *"Only pursue if the benchmark shows the
-pump lagging Dataflow (unlikely given ValueTask vs Task-per-send)."* **That trigger has now fired**: BufferBlock
-is 1.44x slower *and* 2.26x the allocation, the only block in the suite that loses on both axes.
+pump lagging Dataflow."* That trigger fired - BufferBlock was 1.44x slower *and* 2.26x the allocation, the only
+block in the suite losing on both axes - so it was built.
 
-Measured cause: BufferBlock pays exactly two channel hops where one would do. A raw single hop of 50_000 items is
-~3.2 ms / 179 KB; BufferBlock is ~6.2 ms / 567 KB - almost exactly double, plus a second deque growing to hold
-the same backlog twice.
+`PropagatorFluxBlockBase` gained an `aliasOutputToInput` ctor flag that makes `_output` the very same channel
+object as `_input` (`(Channel<TOut>)(object)_input`, guarded by a `Debug.Assert` on `TIn == TOut`). `BufferBlock`
+has no pump loop and no second channel: producers write the channel that `DispatchLoopAsync` and
+`ReceiveAllAsync` read. **Deliberately BufferBlock-only** - any block that transforms, batches, or otherwise
+decouples its input rate from its output rate needs two channels to apply backpressure independently.
 
-Sketch, if pursued: give `PropagatorFluxBlockBase` a ctor flag that aliases `_output` to `_input` when
-`TIn == TOut` (`(Channel<TOut>)(object)_input`), so `BufferBlock` has no pump loop and no second channel at all -
-`DispatchLoopAsync` and `ReceiveAllAsync` read the same channel producers write to. Costs: `outputSingleWriter`
-must become `false`, `ItemsProcessed` no longer has a pump to fire from (would have to move to `TryOffer` or be
-dropped for this block), and `Completion` must resolve off `_input.Reader.Completion` instead of a pump task.
+| BufferBlock vs Dataflow | before | after |
+|---|---|---|
+| `Throughput` (burst) time | 1.44x | **0.68x** |
+| `Throughput` (burst) alloc | 2.26x | 1.96x |
+| `Backpressure` (concurrent) time | 0.92x | **0.33x** |
+| `Backpressure` (concurrent) alloc | 0.48x | **0.18x** |
+
+The burst-mode allocation barely moved, and that is expected rather than a miss: with 50_000 items sent before
+anything drains, whichever channel holds the backlog must grow a deque to 50_000 entries, and that single deque
+dominates. Removing the *second* channel removed only the shallower of the two. The concurrent numbers - 3x
+faster, 5.5x leaner - are the ones that reflect the change.
+
+Three things the pump loop was silently doing besides moving items, all of which had to be replaced:
+
+1. **It was the block's only cancellation observer.** Every Flux block learns its options token fired by having a
+   loop awaiting `WaitToReadAsync(_loopToken)`. With no pump, nothing completes the channel on cancellation and
+   `Completion` would hang instead of resolving `Canceled`. `FinalizeAsync` now awaits `_input.Reader.Completion`,
+   wrapped in `WaitAsync(_loopToken)` only when `_loopToken.CanBeCanceled` - which keeps the None-token
+   allocation trick intact for the common case.
+2. **It made `Fault` look decisive.** A bounded channel withholds its reader-side completion signal until the
+   queue empties *even when completed with an error*, so a faulted block with buffered items would sit pending
+   until something drained it. `Fault` is now `virtual` on `TargetFluxBlockBase` and `BufferBlock` overrides it to
+   discard the buffer - which is what `IFluxTarget<T>.Fault`'s own XML doc already promised, and what Dataflow
+   does ("faulting a block... causes buffered messages... to be lost").
+3. **It was the `ItemsProcessed` firing site.** Replaced by a `_countAcceptedAsProcessed` flag on
+   `TargetFluxBlockBase`, checked field-first in `TryOffer` so every other block pays a predicted-not-taken
+   branch that never loads the instrument. For a passthrough, accepted and processed are the same count.
+
+Two deliberate behavior changes, both moving *toward* Dataflow parity rather than away from it:
+
+- `BoundedCapacity = N` now means exactly N items resident, not up to 2N across two channels.
+- `Completion` resolves once the block is completed *and* drained, so a completed buffer with no consumer and no
+  link stays pending. `Fault` is exempt, per above.
+
+Coverage added on top of the existing BufferBlock tests, since BufferBlock is now the one block whose dispatch
+loop reads the same channel its producers write to: multi-link `Broadcast`/`RoundRobin`/`FirstAvailable`,
+per-link filters, `LinkTo` against an already-buffered backlog, unlink-then-relink, 8-way concurrent producers
+under a capacity of 16, plus the changed `Complete`/`Fault`/cancellation semantics and BufferBlock's
+`ItemsProcessed`. 112 tests, stable over 10 repeat runs.
