@@ -4,11 +4,9 @@ using LaquaiLib.Flux.Primitives;
 namespace LaquaiLib.Flux;
 
 /// <summary>
-/// A Flux block that buffers items without transformation, exposing them for linking or pull-based consumption.
-/// <para/>
-/// A single internal pump loop moves items from the input channel to the output channel unchanged, preserving
-/// order. <see cref="FluxBlockOptions.MaxDegreeOfParallelism"/> is deliberately ignored: there is nothing to
-/// parallelize when the "work" is just moving an item from one channel to another.
+/// A Flux block that buffers items without transformation.
+/// Note that most features of the library (parallelization capabilities built into blocks, many-to-one composition semantics, etc.) make this block effectively a "no-op" in many scenarios.
+/// Its primary use is as the ingress point for a Flux pipeline.
 /// </summary>
 /// <typeparam name="T">The type of item buffered by this block.</typeparam>
 public sealed class BufferBlock<T> : PropagatorFluxBlockBase<T, T>
