@@ -16,7 +16,7 @@ namespace LaquaiLib.Flux;
 /// <see cref="BatchBlock{T}"/>'s output to more than one target; single-link, <see cref="FluxFanOutMode.FirstAvailable"/>,
 /// <see cref="FluxFanOutMode.RoundRobin"/>, and plain <see cref="IFluxSource{TOut}.ReceiveAllAsync"/> consumption
 /// are all single-owner and safe. If multiple independent consumers of the same batch are unavoidable, have the
-/// single receiving target call <see cref="PooledBatch{T}.Memory"/>.ToArray() and hand out copies instead.
+/// single receiving target call <see cref="PooledBatch{T}.ToArray"/> and hand out copies instead.
 /// <para/>
 /// <see cref="FluxBlockOptions.MaxDegreeOfParallelism"/> is ignored: accumulating items into a batch is inherently
 /// serial (there is one in-progress batch at a time).
