@@ -25,11 +25,10 @@ public class TimeFlushBenchmarks
     private const int WaveCount = 10;
     private const int ItemsPerWave = 3;
 
-    // Large enough that count-based flushing can never trigger (WaveCount * ItemsPerWave is far below it), but
-    // deliberately modest: BatchBlock<T> eagerly rents an array sized to the batch size up front and again on
-    // every flush (see BatchBlock<T>'s ctor/FlushAsync), so an oversized value here (int.MaxValue throws
-    // OutOfMemoryException outright; even 1_000_000 rents a ~4 MB int[] per flush) would dominate the allocation
-    // numbers with pool-priming noise unrelated to what this benchmark is actually measuring.
+    // Large enough that count-based flushing can never trigger (WaveCount * ItemsPerWave is far below it).
+    // BatchBlock<T>'s internal buffer only grows as far as batches are actually filled (starting small and
+    // doubling up to this cap - see BatchBlock<T>'s ctor/AppendCore/GrowBuffer), so this value no longer
+    // dictates the per-flush rental size the way it used to; it just needs to stay unreachable by count.
     private const int UnreachableBatchSize = 10_000;
 
     private static readonly TimeSpan FlushInterval = TimeSpan.FromMilliseconds(10);

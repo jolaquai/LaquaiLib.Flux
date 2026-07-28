@@ -182,6 +182,60 @@ public sealed class BatchBlockTests
         Assert.Equal(TaskStatus.RanToCompletion, block.Completion.Status);
     }
 
+    [Fact]
+    public async Task SendAsync_BatchSizeAboveInitialCapacity_GrowsBufferCorrectly()
+    {
+        // BatchSize (500) is well above the internal starting capacity, forcing several buffer grow-copies
+        // (16 -> 32 -> 64 -> 128 -> 256 -> 500) within the first batch. Every subsequent batch reuses the
+        // already-grown capacity. This exercises that growth never drops or misplaces items.
+        const int batchSize = 500;
+        const int batchCount = 3;
+        var block = new BatchBlock<int>(batchSize);
+
+        for (var i = 0; i < batchSize * batchCount; i++)
+        {
+            await block.SendAsync(i, TestContext.Current.CancellationToken);
+        }
+        block.Complete();
+
+        var batches = new List<int[]>();
+        await foreach (var batch in block.ReceiveAllAsync(TestContext.Current.CancellationToken))
+        {
+            Assert.Equal(batchSize, batch.Count);
+            batches.Add(batch.Memory.ToArray());
+            batch.Dispose();
+        }
+
+        Assert.Equal(batchCount, batches.Count);
+        for (var b = 0; b < batchCount; b++)
+        {
+            for (var i = 0; i < batchSize; i++)
+            {
+                Assert.Equal(b * batchSize + i, batches[b][i]);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task SendAsync_LargeBatchSizeSmallActualBatch_NeverGrowsPastWhatIsUsed()
+    {
+        // Mirrors the hybrid time-flush scenario: a large count cap that is never reached, with only a
+        // handful of items actually accumulated. The buffer should never grow beyond what is needed.
+        var block = new BatchBlock<int>(10_000, TimeSpan.FromMilliseconds(20));
+        for (var i = 0; i < 3; i++)
+        {
+            await block.SendAsync(i, TestContext.Current.CancellationToken);
+        }
+
+        await using var enumerator = block.ReceiveAllAsync(TestContext.Current.CancellationToken).GetAsyncEnumerator(TestContext.Current.CancellationToken);
+        Assert.True(await enumerator.MoveNextAsync());
+        var batch = enumerator.Current;
+        Assert.Equal([0, 1, 2], batch.Memory.ToArray());
+        batch.Dispose();
+
+        block.Complete();
+    }
+
     // ─────────────────────────────────────────────
     //  Time-based flush
     // ─────────────────────────────────────────────
@@ -194,7 +248,7 @@ public sealed class BatchBlockTests
         await block.SendAsync(2, TestContext.Current.CancellationToken);
 
         int[] batch = null;
-        await using var enumerator = block.ReceiveAllAsync(TestContext.Current.CancellationToken).GetAsyncEnumerator();
+        await using var enumerator = block.ReceiveAllAsync(TestContext.Current.CancellationToken).GetAsyncEnumerator(TestContext.Current.CancellationToken);
 
         var moveNextTask = enumerator.MoveNextAsync().AsTask();
         var completed = await Task.WhenAny(moveNextTask, Task.Delay(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken));
@@ -215,7 +269,7 @@ public sealed class BatchBlockTests
         await block.SendAsync(1, TestContext.Current.CancellationToken);
         await block.SendAsync(2, TestContext.Current.CancellationToken);
 
-        await using var enumerator = block.ReceiveAllAsync(TestContext.Current.CancellationToken).GetAsyncEnumerator();
+        await using var enumerator = block.ReceiveAllAsync(TestContext.Current.CancellationToken).GetAsyncEnumerator(TestContext.Current.CancellationToken);
         var moveNextTask = enumerator.MoveNextAsync().AsTask();
 
         // Give a generous window during which a (mis-)firing timer would have surfaced a batch; assert it does not.
@@ -344,7 +398,7 @@ public sealed class BatchBlockTests
         }
         block.Complete();
 
-        await using var enumerator = block.ReceiveAllAsync(TestContext.Current.CancellationToken).GetAsyncEnumerator();
+        await using var enumerator = block.ReceiveAllAsync(TestContext.Current.CancellationToken).GetAsyncEnumerator(TestContext.Current.CancellationToken);
         Assert.True(await enumerator.MoveNextAsync());
         var batch = enumerator.Current;
 

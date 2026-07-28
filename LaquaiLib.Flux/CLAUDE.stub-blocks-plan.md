@@ -139,6 +139,7 @@ private async Task FinalizeAsync()
   `_output.Reader.Completion`) would shave the second buffer, but the base unconditionally allocates `_input`, so
   a real single-channel buffer needs a new base type. Only pursue if the benchmark shows the pump lagging
   Dataflow (unlikely given ValueTask vs Task-per-send).
+  **Status: the benchmark has since shown exactly that - see "Open decision: single-channel `BufferBlock`" below.**
 
 ---
 
@@ -373,13 +374,69 @@ drain/Completion":
 
 ## Implementation checklist
 
-- [ ] `ActionBlock<TIn>`: async ctor body, `WorkerLoopAsync`, `ActionMeasuredAsync`, `FinalizeAsync`, DOP helper
-- [ ] `BufferBlock<T>`: ctor body, `PumpLoopAsync`, `FinalizeAsync`; document DOP-ignored
-- [ ] `PooledBatch<T>` struct (new file) + XML-doc contract
-- [ ] `BatchBlock<T>`: retype base to `<T, PooledBatch<T>>`, ctor body, `ReaderLoopAsync`, `TimerLoopAsync`,
+- [x] `ActionBlock<TIn>`: async ctor body, `WorkerLoopAsync`, `ActionMeasuredAsync`, `FinalizeAsync`, DOP helper
+- [x] `BufferBlock<T>`: ctor body, `PumpLoopAsync`, `FinalizeAsync`; document DOP-ignored
+- [x] `PooledBatch<T>` struct (new file) + XML-doc contract
+- [x] `BatchBlock<T>`: retype base to `<T, PooledBatch<T>>`, ctor body, `ReaderLoopAsync`, `TimerLoopAsync`,
       `FlushAsync`, `FinalizeAsync`, `ReturnBufferOnFault`
-- [ ] `ActionBlockTests`, `BufferBlockTests`, `BatchBlockTests`
-- [ ] `ActionBlocks/`, `BufferBlocks/`, `BatchBlocks/` benchmark suites
-- [ ] Metrics: confirm `ItemsProcessed` (+ `StageLatency` for ActionBlock) fire; extend `DiagnosticsTests` if a
+- [x] `ActionBlockTests`, `BufferBlockTests`, `BatchBlockTests` (101 tests total, stable over 5 repeat runs)
+- [x] `ActionBlocks/`, `BufferBlocks/`, `BatchBlocks/` benchmark suites
+- [x] Metrics: confirm `ItemsProcessed` (+ `StageLatency` for ActionBlock) fire; extend `DiagnosticsTests` if a
       block exposes a metric path the TransformBlock tests do not already cover (e.g. batch `ItemsProcessed` adds
       N at once)
+
+### Post-implementation optimization pass
+
+- [x] `BatchBlock<T>` grow-on-demand buffer: rent at `min(batchSize, 16)` and double up to `batchSize` instead of
+      renting `batchSize` up front, so a large-cap hybrid policy never rents more than it fills (`AppendCore`/
+      `GrowBuffer`/`TryDetachBuffer`).
+- [x] `BatchBlock<T>` lock elision: with no timer loop the reader loop is the sole toucher of
+      `_buffer`/`_capacity`/`_count`, so `_batchLock` is skipped entirely on the per-item path. Gated on a
+      `readonly bool _hasTimer` assigned *before* the reader loop is queued - testing `_timerLoop is not null`
+      instead would be read by a loop started before that field's assignment, with no happens-before edge making
+      it visible.
+- [x] `BatchBlocks/SteadyStateBenchmarks` added: the existing `ThroughputBenchmarks` sends all 50_000 items before
+      draining any, which structurally cannot show a pooling win (see findings below).
+
+## Benchmark findings (post-implementation, AMD 7900X, net10.0 host)
+
+Flux wins decisively on allocation and is at parity-or-better on time **when per-item work is non-trivial**, and
+loses on time **when the per-item work is trivial enough that channel plumbing is the whole cost**:
+
+| Suite | Flux time vs Dataflow | Flux alloc vs Dataflow |
+|---|---|---|
+| `TransformBlocks/Throughput` (DOP 1 / 4) | 0.88x - 1.07x | 0.42x - 0.73x |
+| `BatchBlocks/SteadyState` (bs 10 / 100 / 1000) | 0.88x / 1.79x / 2.37x | **0.24x / 0.05x / 0.08x** |
+| `BatchBlocks/Throughput` (burst, bs 10 / 100 / 1000) | ~2.0x / 2.1x / 2.2x | 1.35x / 0.25x / 0.14x |
+| `BufferBlocks/Throughput` | 1.44x | **2.26x** |
+
+- **The steady-state batch numbers are the marquee result**, not the burst ones. `ThroughputBenchmarks` sends
+  everything before draining, leaving thousands of rented arrays live at small batch sizes - far more than
+  `ArrayPool<T>.Shared` retains, so nearly every rent misses the pool and every return is dropped to the GC. That
+  is why burst-mode `bs=10` shows Flux allocating *more* (1.35x) than Dataflow. Under concurrent drain the same
+  config allocates 0.24x, and `bs=100` collapses to 0.05x.
+- **The ~2x time gap on `BatchBlock` is architectural, not a defect.** Probed directly: one raw bounded-channel
+  hop of 50_000 items costs ~3.2 ms, and the whole Flux `BatchBlock` costs ~3.35 ms - i.e. accumulation and
+  flushing are nearly free and the cost *is* the input-channel hop. Dataflow's `BatchBlock` accumulates on the
+  caller's thread under its own lock and never pays a cross-thread queue handoff. Closing this would mean
+  batching inside `TryOffer` rather than in a reader loop, abandoning the uniform channel architecture. Not
+  worth it; documented instead.
+- **Bounded-channel queue growth dominates Flux's remaining allocation.** A raw single hop allocates 9.7 KB at
+  `BoundedCapacity = 1_000`, but 179 KB at `1_000_000` - the channel's internal deque doubling to hold the
+  backlog. Benchmarks that pair a huge capacity with a burst producer are measuring deque growth, not the block.
+
+## Open decision: single-channel `BufferBlock`
+
+The "out of scope (noted, not built)" item above was explicitly gated on *"Only pursue if the benchmark shows the
+pump lagging Dataflow (unlikely given ValueTask vs Task-per-send)."* **That trigger has now fired**: BufferBlock
+is 1.44x slower *and* 2.26x the allocation, the only block in the suite that loses on both axes.
+
+Measured cause: BufferBlock pays exactly two channel hops where one would do. A raw single hop of 50_000 items is
+~3.2 ms / 179 KB; BufferBlock is ~6.2 ms / 567 KB - almost exactly double, plus a second deque growing to hold
+the same backlog twice.
+
+Sketch, if pursued: give `PropagatorFluxBlockBase` a ctor flag that aliases `_output` to `_input` when
+`TIn == TOut` (`(Channel<TOut>)(object)_input`), so `BufferBlock` has no pump loop and no second channel at all -
+`DispatchLoopAsync` and `ReceiveAllAsync` read the same channel producers write to. Costs: `outputSingleWriter`
+must become `false`, `ItemsProcessed` no longer has a pump to fire from (would have to move to `TryOffer` or be
+dropped for this block), and `Completion` must resolve off `_input.Reader.Completion` instead of a pump task.

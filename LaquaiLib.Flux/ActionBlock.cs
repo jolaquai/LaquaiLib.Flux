@@ -10,7 +10,6 @@ namespace LaquaiLib.Flux;
 public sealed class ActionBlock<TIn> : TargetFluxBlockBase<TIn>
 {
     private readonly Func<TIn, ValueTask> _action;
-    private readonly int _maxDegreeOfParallelism;
     private readonly Task[] _workers;
 
     /// <summary>
@@ -36,8 +35,7 @@ public sealed class ActionBlock<TIn> : TargetFluxBlockBase<TIn>
     {
         ArgumentNullException.ThrowIfNull(action);
         _action = action;
-        _maxDegreeOfParallelism = GetMaxDegreeOfParallelism(_options);
-        _workers = new Task[_maxDegreeOfParallelism];
+        _workers = new Task[GetMaxDegreeOfParallelism(_options)];
         for (var i = 0; i < _workers.Length; i++)
         {
             _workers[i] = Task.Run(WorkerLoopAsync);

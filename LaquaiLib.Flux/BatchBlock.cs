@@ -20,18 +20,32 @@ namespace LaquaiLib.Flux;
 /// <para/>
 /// <see cref="FluxBlockOptions.MaxDegreeOfParallelism"/> is ignored: accumulating items into a batch is inherently
 /// serial (there is one in-progress batch at a time).
+/// <para/>
+/// The in-progress buffer starts small and grows (doubling, capped at <c>batchSize</c>) only as far as batches
+/// actually get filled, rather than always renting a <c>batchSize</c>-length array up front: a hybrid count/time
+/// policy with a large count cap but consistently small time-triggered batches never rents more than it actually
+/// uses. A workload that reliably fills batches to capacity converges to renting at <c>batchSize</c> after a
+/// handful of amortized grow-copies and stays there for the rest of its lifetime.
 /// </summary>
 /// <typeparam name="T">The type of item accepted and batched by this block.</typeparam>
 public sealed class BatchBlock<T> : PropagatorFluxBlockBase<T, PooledBatch<T>>
 {
+    private const int InitialCapacity = 16;
+
     private readonly int _batchSize;
     private readonly TimeSpan _flushInterval;
 
     private T[] _buffer;
+    private int _capacity;
     private int _count;
 
     private readonly LockType _batchLock = new();
     private readonly SemaphoreSlim _writeGate = new(1, 1);
+
+    // Read per item by ReaderLoopAsync to decide whether _batchLock is needed at all, so it must be assigned
+    // before that loop is even queued - a plain `_timerLoop is not null` test would be read by a loop that was
+    // started before _timerLoop's assignment, with no happens-before edge to make that assignment visible.
+    private readonly bool _hasTimer;
 
     private readonly PeriodicTimer _timer;
     private readonly Task _readerLoop;
@@ -61,13 +75,17 @@ public sealed class BatchBlock<T> : PropagatorFluxBlockBase<T, PooledBatch<T>>
         ArgumentOutOfRangeException.ThrowIfLessThan(batchSize, 1);
         _batchSize = batchSize;
         _flushInterval = flushInterval;
-        _buffer = ArrayPool<T>.Shared.Rent(_batchSize);
-
-        _readerLoop = Task.Run(ReaderLoopAsync);
-
-        if (_flushInterval != Timeout.InfiniteTimeSpan)
+        _capacity = Math.Min(_batchSize, InitialCapacity);
+        _buffer = ArrayPool<T>.Shared.Rent(_capacity);
+        _hasTimer = flushInterval != Timeout.InfiniteTimeSpan;
+        if (_hasTimer)
         {
             _timer = new PeriodicTimer(_flushInterval);
+        }
+
+        _readerLoop = Task.Run(ReaderLoopAsync);
+        if (_hasTimer)
+        {
             _timerLoop = Task.Run(TimerLoopAsync);
         }
 
@@ -83,11 +101,20 @@ public sealed class BatchBlock<T> : PropagatorFluxBlockBase<T, PooledBatch<T>>
             {
                 while (reader.TryRead(out var item))
                 {
+                    // No timer loop means ReaderLoopAsync is the only thing that will ever touch _buffer/_capacity/
+                    // _count - including via FlushAsync, which it only ever calls in-line, never concurrently with
+                    // itself - so the lock has nothing to guard against and is skipped entirely.
                     bool full;
-                    lock (_batchLock)
+                    if (_hasTimer)
                     {
-                        _buffer[_count++] = item;
-                        full = _count == _batchSize;
+                        lock (_batchLock)
+                        {
+                            full = AppendCore(item);
+                        }
+                    }
+                    else
+                    {
+                        full = AppendCore(item);
                     }
                     if (full)
                     {
@@ -101,6 +128,36 @@ public sealed class BatchBlock<T> : PropagatorFluxBlockBase<T, PooledBatch<T>>
             TrySetFault(ex);
             _input.Writer.TryComplete(ex);
         }
+    }
+
+    /// <summary>
+    /// Appends <paramref name="item"/> to <see cref="_buffer"/>, growing it first if it is currently at capacity.
+    /// Caller is responsible for holding <see cref="_batchLock"/> if a timer loop exists (see call sites).
+    /// </summary>
+    private bool AppendCore(T item)
+    {
+        if (_count == _capacity)
+        {
+            GrowBuffer();
+        }
+        _buffer[_count++] = item;
+        return _count == _batchSize;
+    }
+
+    /// <summary>
+    /// Doubles <see cref="_buffer"/>'s logical capacity (capped at <see cref="_batchSize"/>) and migrates the
+    /// in-progress items into the new rental. Never called with <see cref="_capacity"/> already at
+    /// <see cref="_batchSize"/>: reaching that count always flushes (via <see cref="AppendCore"/>'s return value)
+    /// before another item can arrive to grow into.
+    /// </summary>
+    private void GrowBuffer()
+    {
+        var newCapacity = Math.Min(_capacity * 2, _batchSize);
+        var newBuffer = ArrayPool<T>.Shared.Rent(newCapacity);
+        Array.Copy(_buffer, newBuffer, _count);
+        ArrayPool<T>.Shared.Return(_buffer, clearArray: RuntimeHelpers.IsReferenceOrContainsReferences<T>());
+        _buffer = newBuffer;
+        _capacity = newCapacity;
     }
 
     private async Task TimerLoopAsync()
@@ -128,17 +185,20 @@ public sealed class BatchBlock<T> : PropagatorFluxBlockBase<T, PooledBatch<T>>
         {
             T[] buf;
             int n;
-            lock (_batchLock)
+            if (_hasTimer)
             {
-                if (_count == 0)
+                lock (_batchLock)
                 {
-                    // Nothing to flush - the peer (reader-loop count-flush vs timer-loop time-flush) already took it.
-                    return;
+                    if (!TryDetachBuffer(out buf, out n))
+                    {
+                        // Nothing to flush - the peer (reader-loop count-flush vs timer-loop time-flush) already took it.
+                        return;
+                    }
                 }
-                buf = _buffer;
-                n = _count;
-                _buffer = ArrayPool<T>.Shared.Rent(_batchSize);
-                _count = 0;
+            }
+            else if (!TryDetachBuffer(out buf, out n))
+            {
+                return;
             }
 
             var batch = new PooledBatch<T>(buf, n);
@@ -155,6 +215,26 @@ public sealed class BatchBlock<T> : PropagatorFluxBlockBase<T, PooledBatch<T>>
         {
             _writeGate.Release();
         }
+    }
+
+    /// <summary>
+    /// Detaches the in-progress buffer for emission and rents its replacement, sized to the (possibly already
+    /// grown) current <see cref="_capacity"/> rather than <see cref="_batchSize"/>. Caller is responsible for
+    /// holding <see cref="_batchLock"/> if a timer loop exists (see call sites).
+    /// </summary>
+    private bool TryDetachBuffer(out T[] buf, out int n)
+    {
+        if (_count == 0)
+        {
+            buf = null;
+            n = 0;
+            return false;
+        }
+        buf = _buffer;
+        n = _count;
+        _buffer = ArrayPool<T>.Shared.Rent(_capacity);
+        _count = 0;
+        return true;
     }
 
     private void ReturnBufferOnFault()
