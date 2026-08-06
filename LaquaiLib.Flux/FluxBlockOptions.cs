@@ -36,7 +36,7 @@ public sealed class FluxBlockOptions
     /// <summary>
     /// Gets or sets the <see cref="System.Threading.CancellationToken"/> observed by this block. Cancellation
     /// transitions <see cref="IFluxBlock.Completion"/> to the canceled state and stops accepting and processing further items.
-    /// Defaults to <see cref="System.Threading.CancellationToken.None"/>.
+    /// Defaults to <see cref="CancellationToken.None"/>.
     /// </summary>
     public CancellationToken CancellationToken { get; init; }
 
