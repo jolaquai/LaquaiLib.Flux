@@ -108,6 +108,9 @@ public abstract class TargetFluxBlockBase<TIn> : IFluxTarget<TIn>
         return false;
     }
 
+    // Pooled builder: under multi-producer contention this suspends on a large fraction of sends, and the
+    // default builder heap-allocates a state machine box per suspension.
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     private async ValueTask<bool> SendAsyncSlow(TIn item, CancellationToken cancellationToken)
     {
         while (true)

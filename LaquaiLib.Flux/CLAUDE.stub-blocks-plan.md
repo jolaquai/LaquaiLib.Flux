@@ -397,8 +397,20 @@ drain/Completion":
       it visible.
 - [x] `BatchBlocks/SteadyStateBenchmarks` added: the existing `ThroughputBenchmarks` sends all 50_000 items before
       draining any, which structurally cannot show a pooling win (see findings below).
+- [x] `TargetFluxBlockBase.SendAsyncSlow` pooled state machine box:
+      `[AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]`. Under multi-producer contention a
+      large fraction of sends suspend and the default builder heap-allocates a box per suspension (~62 B,
+      isolated by probe). Cuts `BatchBlocks/MultiProducer` allocation by 76% / 63% / 51% at 1 / 4 / 8 producers
+      and drops Gen0 to zero at 1 and 4. Time unaffected. Tightens the `SendAsync` single-consumption rule from
+      "undefined if violated" to "corrupting if violated" - see the handoff doc's invariants.
+- [x] `BufferBlocks/MultiProducerBenchmarks` and `TransformBlocks/MultiProducerBenchmarks` added, to establish how
+      wide the multi-producer gap is. Answer: narrower than believed - Flux wins at one producer on all three
+      blocks and is at parity at eight on TransformBlock. See the handoff doc's open item 2.
 
 ## Benchmark findings (post-implementation, AMD 7900X, net10.0 host)
+
+**These are the figures as of the initial implementation and are kept for the reasoning they support, not as
+current numbers.** The live benchmark picture lives in [CLAUDE.handoff.md](CLAUDE.handoff.md).
 
 Flux wins decisively on allocation and is at parity-or-better on time **when per-item work is non-trivial**, and
 loses on time **when the per-item work is trivial enough that channel plumbing is the whole cost**:
