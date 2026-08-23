@@ -1,9 +1,14 @@
 # Flux session handoff
 
 Snapshot of repo state and in-flight efforts as of 2026-08-06 (second session). Companion to
-[CLAUDE.stub-blocks-plan.md](CLAUDE.stub-blocks-plan.md) (the live plan, kept current),
+[CLAUDE.dataflow-parity-plan.md](CLAUDE.dataflow-parity-plan.md) (**what stands between here and a defensible
+"drop-in replacement" claim - read this before pitching the library**),
+[CLAUDE.stub-blocks-plan.md](CLAUDE.stub-blocks-plan.md) (block implementation, complete),
 [CLAUDE.flux-plan.md](CLAUDE.flux-plan.md) (v1 scope) and [CLAUDE.fanout-multilink-plan.md](CLAUDE.fanout-multilink-plan.md)
 (shipped).
+
+Scope split: **this file owns repo state, benchmark numbers and perf open items; the parity plan owns API-surface
+gaps.** Perf items appear in both, quantified here and prioritized there.
 
 ## Repo state
 
